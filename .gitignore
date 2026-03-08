@@ -1,0 +1,58 @@
+# ─── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+*.env
+*.log
+.DS_Store
+
+# ─── Virtual Environments ─────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ─── ML Model Files ───────────────────────────────────────────
+ml/saved_models/
+*.h5
+*.keras
+*.pkl
+*.joblib
+
+# ─── Node.js / Frontend ───────────────────────────────────────
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Database ─────────────────────────────────────────────────
+*.sqlite3
+*.db
+
+# ─── IDE ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Docker ──────────────────────────────────────────────────
+.docker-data/
+
+# ─── Coverage ─────────────────────────────────────────────────
+htmlcov/
+.coverage
+.pytest_cache/
+coverage.xml
+
+# ─── OS ──────────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
