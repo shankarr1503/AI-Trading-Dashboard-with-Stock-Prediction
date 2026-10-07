@@ -34,8 +34,12 @@ class RiskConfig:
     max_correlation: float = 0.85
     max_correlated_positions: int = 2
     high_vol_size_mult: float = 0.5
+    # The edge is unproven until walk-forward calibration exists: trade smaller.
+    uncalibrated_size_mult: float = 0.5
     max_consecutive_losses: int = 4
     cooldown_hours: float = 24.0
+    # After a stop-loss exit, don't buy the same symbol back for this long.
+    reentry_cooldown_hours: float = 24.0
     flatten_on_kill: bool = True
 
     def to_dict(self) -> dict:
@@ -58,8 +62,10 @@ class RiskConfig:
         "max_correlation": (0.5, 0.99),
         "max_correlated_positions": (0, 10),
         "high_vol_size_mult": (0.1, 1.0),
+        "uncalibrated_size_mult": (0.1, 1.0),
         "max_consecutive_losses": (2, 20),
         "cooldown_hours": (1.0, 168.0),
+        "reentry_cooldown_hours": (0.0, 720.0),
     }
 
     def with_overrides(self, overrides: Optional[dict]) -> "RiskConfig":
@@ -160,9 +166,11 @@ class RiskManager:
             reasons.append(f"Cooling down after {snap.consecutive_losses} consecutive losses")
         return BreakerStatus(allow_entries=not reasons, kill=kill, reasons=reasons)
 
-    def size_multiplier(self, snap: PortfolioSnapshot, regime: str) -> float:
+    def size_multiplier(self, snap: PortfolioSnapshot, regime: str, calibrated: bool = True) -> float:
         c = self.config
         mult = c.high_vol_size_mult if regime == Regime.HIGH_VOLATILITY.value else 1.0
+        if not calibrated:
+            mult *= c.uncalibrated_size_mult
         dd = snap.drawdown_pct
         if dd > c.drawdown_throttle_start_pct:
             span = max(1e-9, c.max_drawdown_pct - c.drawdown_throttle_start_pct)
@@ -176,7 +184,13 @@ class RiskManager:
         correlations: Optional[Dict[str, float]] = None,
         reserved_cash: float = 0.0,
         pending_positions: int = 0,
+        explore: bool = False,
     ) -> RiskDecision:
+        """
+        Size and approve/reject one entry. `explore=True` (used only by the
+        calibration backtests) skips the edge-based gates so the calibrator sees
+        every signal the strategy produces, not just the ones the prior liked.
+        """
         c = self.config
         reasons: List[str] = []
 
@@ -197,20 +211,25 @@ class RiskManager:
         cm = p.cost_model
         entry_fill = cm.fill_price("BUY", p.price)
         stop_fill = cm.fill_price("SELL", p.stop)
-        risk_per_share = entry_fill - stop_fill
+        # Loss per share if the stop fills: slipped prices plus fees on both legs.
+        fees_per_share = entry_fill * (cm.buy_fee_pct + cm.commission_pct) + stop_fill * (cm.sell_fee_pct + cm.commission_pct) \
+            + 2 * cm.commission_per_share
+        risk_per_share = entry_fill - stop_fill + fees_per_share
         reward_risk = (p.target - p.price) / (p.price - p.stop)
         if reward_risk < c.min_reward_risk:
             return reject(f"Reward:risk {reward_risk:.2f} < {c.min_reward_risk}")
 
         ev_r = p.edge.ev_r
-        if ev_r < c.min_ev_r:
-            return reject(f"Expectancy {ev_r:+.3f}R < minimum {c.min_ev_r}R ({p.edge.source} edge estimate)")
         kelly = p.edge.kelly
-        if kelly <= 0:
-            return reject("Kelly fraction ≤ 0: no positive edge")
+        if not explore:
+            if ev_r < c.min_ev_r:
+                return reject(f"Expectancy {ev_r:+.3f}R < minimum {c.min_ev_r}R ({p.edge.source} edge estimate)")
+            if kelly <= 0:
+                return reject("Kelly fraction ≤ 0: no positive edge")
 
         # ── Position sizing ──
-        risk_pct = min(c.max_risk_per_trade_pct, c.kelly_scale * kelly) * self.size_multiplier(snap, p.regime)
+        base_risk = c.max_risk_per_trade_pct if explore else min(c.max_risk_per_trade_pct, c.kelly_scale * kelly)
+        risk_pct = base_risk * self.size_multiplier(snap, p.regime, calibrated=p.edge.source == "calibrated")
         risk_budget = snap.equity * risk_pct
         qty_risk = risk_budget / risk_per_share
         qty_conc = c.max_position_pct * snap.equity / entry_fill
@@ -235,24 +254,29 @@ class RiskManager:
         if notional < c.min_notional:
             return reject(f"Notional ${notional:,.0f} below minimum ${c.min_notional:,.0f}")
 
-        # ── Cost gate: the edge must comfortably exceed what the trade costs ──
+        # ── Cost gate: the gross edge must comfortably exceed what the trade costs ──
+        # Calibrated ev_r is already net of costs (backtest P&L paid them), so add
+        # them back to get the gross edge; the prior is a gross assumption. Costs
+        # are therefore counted exactly once.
         cost_pct = cm.round_trip_cost_pct(p.price, qty)
-        expected_edge_pct = ev_r * (risk_per_share / p.price)
-        net_edge_pct = expected_edge_pct - cost_pct
+        edge_pct = ev_r * (risk_per_share / p.price)
+        gross_edge_pct = edge_pct + cost_pct if p.edge.net_of_costs else edge_pct
+        net_edge_pct = gross_edge_pct - cost_pct
         common = dict(
-            expected_edge_pct=round(expected_edge_pct, 6), cost_pct=round(cost_pct, 6),
+            expected_edge_pct=round(gross_edge_pct, 6), cost_pct=round(cost_pct, 6),
             net_edge_pct=round(net_edge_pct, 6),
         )
-        if expected_edge_pct < c.cost_safety_multiple * cost_pct:
+        if not explore and gross_edge_pct < c.cost_safety_multiple * cost_pct:
             return reject(
-                f"Edge {expected_edge_pct:.3%} < {c.cost_safety_multiple}× round-trip cost {cost_pct:.3%}",
+                f"Gross edge {gross_edge_pct:.3%} < {c.cost_safety_multiple}× round-trip cost {cost_pct:.3%}",
                 **common,
             )
 
         risk_amount = qty * risk_per_share
         reasons.append(
             f"Approved {qty} sh (binding: {binding}); risk ${risk_amount:,.0f} "
-            f"({risk_amount / snap.equity:.2%} of equity); edge {expected_edge_pct:.2%} vs cost {cost_pct:.2%}"
+            f"({risk_amount / snap.equity:.2%} of equity); gross edge {gross_edge_pct:.2%} vs cost {cost_pct:.2%}"
+            + ("" if p.edge.source == "calibrated" else f"; uncalibrated edge → size ×{c.uncalibrated_size_mult}")
         )
         return RiskDecision(
             approved=True, qty=qty, reasons=reasons, risk_amount=round(risk_amount, 2),

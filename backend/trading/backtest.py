@@ -79,13 +79,21 @@ def performance_metrics(equity: pd.Series, trades: List[Dict], exposure: pd.Seri
     if len(equity) < 2:
         return {}
     rets = equity.pct_change().dropna()
-    years = max(len(equity) / 252, 1e-9)
+    # Annualise by calendar time, not bar count: a mixed US + NSE universe has
+    # more bars per year than either exchange alone.
+    if isinstance(equity.index, pd.DatetimeIndex) and len(equity) > 1:
+        years = max((equity.index[-1] - equity.index[0]).days / 365.25, 1 / 365.25)
+    else:
+        years = max(len(equity) / 252, 1e-9)
+    periods_per_year = len(rets) / years if years > 0 else 252
     total = equity.iloc[-1] / equity.iloc[0] - 1
     cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1 if equity.iloc[-1] > 0 else -1.0
-    vol = rets.std() * math.sqrt(252)
-    downside = rets[rets < 0].std() * math.sqrt(252)
-    sharpe = (rets.mean() * 252) / vol if vol > 0 else 0.0
-    sortino = (rets.mean() * 252) / downside if downside and downside > 0 else 0.0
+    vol = rets.std() * math.sqrt(periods_per_year)
+    # Sortino uses downside deviation (RMS of negative returns, zeros included).
+    downside = math.sqrt(float((np.minimum(rets, 0) ** 2).mean())) * math.sqrt(periods_per_year) if len(rets) else 0.0
+    ann_mean = rets.mean() * periods_per_year
+    sharpe = ann_mean / vol if vol > 0 else 0.0
+    sortino = ann_mean / downside if downside > 0 else 0.0
     dd = equity / equity.cummax() - 1
     max_dd = float(dd.min())
     wins = [t for t in trades if t["pnl"] > 0]
@@ -134,10 +142,13 @@ def run_backtest(
     start: Optional[pd.Timestamp] = None,
     end: Optional[pd.Timestamp] = None,
     frames: Optional[Dict[str, pd.DataFrame]] = None,
+    explore: bool = False,
 ) -> BacktestResult:
     """
     Simulate the bot on daily OHLCV data (dict symbol → DataFrame indexed by date).
-    Trading happens only within [start, end]; earlier bars are used for indicator warm-up.
+    Trading happens only within [start, end]; earlier bars are used for indicator warm-up,
+    and the indicator warm-up period itself is excluded from the reported results.
+    `explore=True` takes every signal (no edge gates) to generate calibration data.
     """
     cfg = cfg or BacktestConfig()
     calibrator = calibrator or Calibrator()
@@ -148,7 +159,9 @@ def run_backtest(
         raise ValueError("Not enough history for any symbol (need ~210+ daily bars)")
 
     dates = sorted(set().union(*(f.index for f in frames.values())))
-    dates = [d for d in dates if (start is None or d >= start) and (end is None or d <= end)]
+    first_tradeable = min(f.index[scfg.min_history] for f in frames.values() if len(f) > scfg.min_history)
+    dates = [d for d in dates if d >= first_tradeable
+             and (start is None or d >= start) and (end is None or d <= end)]
     if len(dates) < 2:
         raise ValueError("Backtest window too short")
     pos_in = {s: {d: i for i, d in enumerate(f.index)} for s, f in frames.items()}
@@ -214,9 +227,15 @@ def run_backtest(
             pending_entries.pop(sym)
             bar = frames[sym].iloc[i]
             cm = cm_for(sym)
-            if bar["open"] <= order["stop"]:
-                continue  # gapped through the stop before we got in: skip
-            fill = cm.fill_price("BUY", float(bar["open"]))
+            o = float(bar["open"])
+            # Same rule as the live agent: a gap larger than gap_filter_atr × ATR
+            # from the signal price is new information, so the entry is skipped;
+            # otherwise stop/target are re-anchored to the actual entry price.
+            if abs(o - order["signal_price"]) > scfg.gap_filter_atr * order["atr"]:
+                continue
+            order["stop"] = o - (order["signal_price"] - order["stop"])
+            order["target"] = o + (order["target"] - order["signal_price"])
+            fill = cm.fill_price("BUY", o)
             qty = order["qty"]
             fees = cm.fees("BUY", qty, fill)
             if qty * fill + fees > cash:
@@ -241,6 +260,8 @@ def run_backtest(
             o, h, l = float(bar["open"]), float(bar["high"]), float(bar["low"])
             if o <= p.stop:
                 close_position(p, o, date, "stop_gap", i)
+            elif p.target and o >= p.target:
+                close_position(p, o, date, "target_gap", i)   # gapped through the target: fill at the better open
             elif l <= p.stop:
                 close_position(p, p.stop, date, "stop", i)
             elif p.target and h >= p.target:
@@ -330,9 +351,11 @@ def run_backtest(
             decision = risk.evaluate(
                 TradeProposal(sym, price, stop, target, score, regime, edge, cm_for(sym)),
                 snap, correlations=corr, reserved_cash=reserved, pending_positions=len(pending_entries),
+                explore=explore,
             )
             if decision.approved:
-                pending_entries[sym] = {"qty": decision.qty, "stop": stop, "target": target, "atr": atr, "score": score}
+                pending_entries[sym] = {"qty": decision.qty, "stop": stop, "target": target, "atr": atr, "score": score,
+                                        "signal_price": price}
                 reserved += decision.notional * 1.01
 
     # Close anything still open at the last available price (marks the final result honestly).
@@ -346,9 +369,10 @@ def run_backtest(
     exposure = pd.Series([r["exposure"] for r in equity_rows])
     metrics = performance_metrics(eq, trades, exposure)
 
-    # Benchmark: equal-weight buy & hold of the same universe over the same window.
-    window_closes = closes.loc[(closes.index >= dates[0]) & (closes.index <= dates[-1])].ffill()
-    bench = window_closes.div(window_closes.bfill().iloc[0]).mean(axis=1) * cfg.initial_capital
+    # Benchmark: equal-weight, daily-rebalanced basket of the same universe over the
+    # same window (a symbol that starts trading later joins without a jump).
+    window_rets = returns.loc[(returns.index >= dates[0]) & (returns.index <= dates[-1])]
+    bench = (1 + window_rets.mean(axis=1).fillna(0)).cumprod() * cfg.initial_capital
     bench_metrics = performance_metrics(bench, [], pd.Series([1.0] * len(bench)))
     benchmark = {k: bench_metrics.get(k) for k in ("total_return_pct", "cagr_pct", "sharpe", "max_drawdown_pct")}
     return BacktestResult(metrics=metrics, equity_curve=equity_rows, trades=trades, kill_events=kill_events, benchmark=benchmark)
@@ -361,9 +385,15 @@ def walk_forward(
     min_train_bars: int = 252,
 ) -> Dict:
     """
-    Anchored walk-forward: for each fold, fit the calibrator on trades from all
-    data before the test window, then trade the test window with it.
-    Returns out-of-sample metrics (test windows chained) and the final calibrator.
+    Anchored walk-forward validation of exactly the scheme the live bot uses:
+
+      for each fold: calibrate on an *exploration* backtest (every signal taken)
+      of all data before the test window → trade the test window with the
+      normal risk gates and that calibrator.
+
+    The returned `calibration` is fitted the same way on the full history and is
+    what /api/bot/calibrate stores for live trading; `out_of_sample` is the
+    honest estimate of how that scheme performed on data it never saw.
     """
     cfg = cfg or BacktestConfig()
     frames = _prepare(data, cfg)
@@ -378,11 +408,10 @@ def walk_forward(
 
     folds, oos_trades, curve = [], [], []
     capital = cfg.initial_capital
-    calibrator = Calibrator()
     for k in range(n_folds):
         test_start = test_dates[k * fold_len]
         test_end = test_dates[-1] if k == n_folds - 1 else test_dates[(k + 1) * fold_len - 1]
-        train = run_backtest(data, cfg, Calibrator(), start=dates[cfg.strategy.min_history], end=test_start - pd.Timedelta(days=1), frames=frames)
+        train = run_backtest(data, cfg, Calibrator(), end=test_start - pd.Timedelta(days=1), frames=frames, explore=True)
         calibrator = Calibrator.fit(train.trades)
         fold_cfg = BacktestConfig(**{**cfg.__dict__, "initial_capital": capital})
         test = run_backtest(data, fold_cfg, calibrator, start=test_start, end=test_end, frames=frames)
@@ -391,18 +420,18 @@ def walk_forward(
         curve.extend(test.equity_curve)
         folds.append({
             "fold": k + 1, "test_start": str(pd.Timestamp(test_start).date()), "test_end": str(pd.Timestamp(test_end).date()),
-            "train_trades": len(train.trades), "metrics": test.metrics, "benchmark": test.benchmark,
+            "calibration_trades": len(train.trades), "metrics": test.metrics, "benchmark": test.benchmark,
         })
 
     eq = pd.Series([r["equity"] for r in curve], index=pd.to_datetime([r["date"] for r in curve]))
     oos = performance_metrics(eq, oos_trades, pd.Series([r["exposure"] for r in curve]))
-    final_cal = Calibrator.fit(
-        run_backtest(data, cfg, Calibrator(), start=dates[cfg.strategy.min_history], frames=frames).trades
-    )
+    full = run_backtest(data, cfg, Calibrator(), frames=frames, explore=True)
+    final_cal = Calibrator.fit(full.trades)
     return {
         "out_of_sample": oos,
         "folds": folds,
         "equity_curve": curve,
         "calibration": final_cal.to_dict(),
+        "calibration_trades": len(full.trades),
         "regime_weights": {r.value: w for r, w in REGIME_WEIGHTS.items()},
     }

@@ -85,9 +85,14 @@ def test_bot_controls_require_admin(client):
     _, h_admin, _ = register(client, "admin")
     _, h_user, _ = register(client, "user")
     assert client.get("/api/bot/status").status_code == 401
-    status = client.get("/api/bot/status", headers=h_user).json()
+    # The bot's book is private to the administrator.
+    for path in ("/api/bot/status", "/api/bot/positions", "/api/bot/trades", "/api/bot/decisions", "/api/bot/equity"):
+        assert client.get(path, headers=h_user).status_code == 403
+    status = client.get("/api/bot/status", headers=h_admin).json()
     assert status["mode"] == "paper" and status["enabled"] is False and status["live_trading"] is False
+    assert status["stale"] is True and status["calibration"] is None
     assert client.post("/api/bot/start", headers=h_user).status_code == 403
+    assert client.post("/api/bot/reset-halt", headers=h_admin).status_code == 409   # not halted
     assert client.post("/api/bot/start", headers=h_admin).json() == {"enabled": True}
     assert client.post("/api/bot/stop", headers=h_admin).json() == {"enabled": False}
     bad = client.put("/api/bot/config", headers=h_admin, json={"risk": {"max_risk_per_trade_pct": 0.5}})
@@ -119,7 +124,62 @@ def test_signal_and_bot_analysis(client):
 
 def test_backtest_endpoint(client):
     _, h, _ = register(client, "alice")
+    _, h_user, _ = register(client, "bob")
+    assert client.post("/api/bot/backtest", headers=h_user, json={"symbols": ["AAPL"]}).status_code == 403
     r = client.post("/api/bot/backtest", headers=h, json={"symbols": ["AAPL", "MSFT"], "walk_forward": False})
     assert r.status_code == 200, r.text
     body = r.json()
     assert "metrics" in body and "benchmark" in body and body["symbols"] == ["AAPL", "MSFT"]
+
+
+def test_bot_health_endpoint(client):
+    r = client.get("/api/bot/health")
+    assert r.status_code == 503 and r.json()["healthy"] is False   # no cycle has run yet
+
+
+def test_registration_bootstrap_and_closing(client, monkeypatch):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "BOOTSTRAP_ADMIN_EMAIL", "boss@example.com")
+    first, _, _ = register(client, "mallory")
+    assert not first["is_superuser"]                      # first-come is no longer admin
+    boss, _, _ = register(client, "boss")
+    assert boss["is_superuser"]
+    monkeypatch.setattr(settings, "REGISTRATION_OPEN", False)
+    r = client.post("/auth/register", json={"email": "late@example.com", "username": "late", "password": "x" * 12})
+    assert r.status_code == 403
+
+
+def test_logout_all_revokes_tokens(client):
+    _, h, tok = register(client, "alice")
+    assert client.get("/auth/me", headers=h).status_code == 200
+    assert client.post("/auth/logout-all", headers=h).status_code == 200
+    assert client.get("/auth/me", headers=h).status_code == 401
+    assert client.post("/auth/refresh", json={"refresh_token": tok["refresh_token"]}).status_code == 401
+
+
+def test_duplicate_registration_does_not_leak_which_field(client):
+    register(client, "alice")
+    r = client.post("/auth/register", json={"email": "alice@example.com", "username": "other1", "password": "x" * 12})
+    assert r.status_code == 400 and "email" not in r.json()["detail"].lower()
+
+
+def test_rate_limit_key_uses_real_ip_only_from_proxy():
+    from types import SimpleNamespace
+
+    from backend.ratelimit import client_ip, limiter
+
+    via_proxy = SimpleNamespace(client=SimpleNamespace(host="172.18.0.5"), headers={"x-real-ip": "203.0.113.9"})
+    direct = SimpleNamespace(client=SimpleNamespace(host="8.8.8.8"), headers={"x-real-ip": "1.2.3.4"})
+    assert client_ip(via_proxy) == "203.0.113.9"
+    assert client_ip(direct) == "8.8.8.8"                 # spoofed header ignored from the internet
+    assert limiter._in_memory_fallback_enabled and limiter._swallow_errors
+
+
+def test_websocket_requires_token(client):
+    import pytest
+    from starlette.websockets import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws/market/AAPL") as ws:
+            ws.receive_json()

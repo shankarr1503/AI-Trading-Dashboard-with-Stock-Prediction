@@ -11,12 +11,16 @@ from typing import Dict, Set
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from backend.auth.utils import decode_token
 from backend.market_data.service import market_data_service, validate_symbol
+from backend.ratelimit import client_ip
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 POLL_SECONDS = 5.0
+MAX_SYMBOLS = 50          # distinct symbols with a live poller
+MAX_CONNECTIONS_PER_IP = 5
 
 
 class ConnectionManager:
@@ -25,6 +29,7 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, Set[WebSocket]] = {}
         self._pollers: Dict[str, asyncio.Task] = {}
+        self.per_ip: Dict[str, int] = {}
 
     async def connect(self, websocket: WebSocket, symbol: str):
         await websocket.accept()
@@ -72,12 +77,31 @@ manager = ConnectionManager()
 
 @router.websocket("/market/{symbol}")
 async def websocket_market_stream(websocket: WebSocket, symbol: str):
-    """Stream live quotes for `symbol` every ~5 seconds. Send {"type":"ping"} for a pong."""
+    """
+    Stream live quotes for `symbol` every ~5 seconds; requires `?token=<access token>`.
+    Send {"type":"ping"} for a pong. Connections per IP and polled symbols are capped
+    so the shared market-data quota (which the bot depends on) can't be exhausted.
+    """
+    payload = decode_token(websocket.query_params.get("token", ""))
+    if not payload or payload.get("type") != "access":
+        await websocket.close(code=1008)
+        return
     try:
         symbol = validate_symbol(symbol)
     except ValueError:
         await websocket.close(code=1008)
         return
+    ip = client_ip(websocket)  # type: ignore[arg-type]
+    if manager.per_ip.get(ip, 0) >= MAX_CONNECTIONS_PER_IP or \
+            (symbol not in manager.active_connections and len(manager.active_connections) >= MAX_SYMBOLS):
+        await websocket.close(code=1013)
+        return
+    try:
+        await market_data_service.get_quote(symbol)   # unknown symbols never get a poller
+    except ValueError:
+        await websocket.close(code=1008)
+        return
+    manager.per_ip[ip] = manager.per_ip.get(ip, 0) + 1
     await manager.connect(websocket, symbol)
     try:
         while True:
@@ -94,3 +118,4 @@ async def websocket_market_stream(websocket: WebSocket, symbol: str):
         pass
     finally:
         manager.disconnect(websocket, symbol)
+        manager.per_ip[ip] = max(0, manager.per_ip.get(ip, 1) - 1)

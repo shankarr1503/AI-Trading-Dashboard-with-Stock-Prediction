@@ -22,10 +22,13 @@ class EdgeEstimate:
     avg_loss_r: float
     n_trades: int
     source: str  # "prior" | "calibrated"
+    # Calibrated estimates come from backtest trades whose P&L already paid
+    # spread, slippage and fees; the prior is a gross (before-cost) assumption.
+    net_of_costs: bool = False
 
     @property
     def ev_r(self) -> float:
-        """Expected value per trade in R (before costs)."""
+        """Expected value per trade in R (net of costs when `net_of_costs`)."""
         return self.p_win * self.avg_win_r - (1 - self.p_win) * self.avg_loss_r
 
     @property
@@ -94,7 +97,12 @@ class Calibrator:
         p = (wins + prior.p_win * k) / (n + k)
         avg_win = (b["sum_win_r"] + prior.avg_win_r * kp) / (wins + kp)
         avg_loss = (b["sum_loss_r"] + prior.avg_loss_r * kp) / (losses + kp)
-        return EdgeEstimate(p_win=p, avg_win_r=avg_win, avg_loss_r=avg_loss, n_trades=int(n), source="calibrated")
+        return EdgeEstimate(p_win=p, avg_win_r=avg_win, avg_loss_r=avg_loss, n_trades=int(n), source="calibrated",
+                            net_of_costs=True)
+
+    @property
+    def total_trades(self) -> int:
+        return int(sum(b.get("n", 0) for b in self.stats.values()))
 
     def to_dict(self) -> Dict:
         return self.stats

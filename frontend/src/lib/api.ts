@@ -170,9 +170,19 @@ export const botApi = {
     api.post('/api/bot/backtest', data, { timeout: 300000 }),
 };
 
+// Equity research
+export const researchApi = {
+  fundamentals: (symbol: string) => api.get(`/api/research/${enc(symbol)}/fundamentals`),
+  report: (symbol: string, refresh = false) =>
+    api.get(`/api/research/${enc(symbol)}/report`, { params: { refresh }, timeout: 300000 }),
+  reports: () => api.get('/api/research/reports'),
+  universes: () => api.get('/api/research/universes'),
+  screen: (body: { symbols?: string[]; universe?: string }) => api.post('/api/research/screen', body, { timeout: 300000 }),
+};
+
 // WebSocket factory
 export const createPriceWebSocket = (symbol: string, onMessage: (data: any) => void): WebSocket => {
-  const ws = new WebSocket(`${WS_URL}/ws/market/${enc(symbol)}`);
+  const ws = new WebSocket(`${WS_URL}/ws/market/${enc(symbol)}?token=${enc(tokens.access ?? '')}`);
   ws.onmessage = (event) => {
     try {
       onMessage(JSON.parse(event.data));

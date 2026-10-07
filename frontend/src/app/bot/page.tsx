@@ -49,10 +49,16 @@ export default function BotPage() {
   const [btSymbols, setBtSymbols] = useState('AAPL,MSFT,NVDA,JPM,WMT');
   const [btWalk, setBtWalk] = useState(true);
 
+  const [forbidden, setForbidden] = useState(false);
+
   const load = useCallback(async () => {
     const [s, p, t, d, e, pf] = await Promise.allSettled([
       botApi.status(), botApi.positions(), botApi.trades(), botApi.decisions(60), botApi.equity(), botApi.performance(),
     ]);
+    if (s.status === 'rejected' && (s.reason as any)?.response?.status === 403) {
+      setForbidden(true);
+      return;
+    }
     if (s.status === 'fulfilled') setStatus(s.value.data);
     if (p.status === 'fulfilled') setPositions(p.value.data);
     if (t.status === 'fulfilled') setTrades(t.value.data);
@@ -74,7 +80,8 @@ export default function BotPage() {
     setMsg('');
     try {
       const r = await fn();
-      setMsg(r?.data?.status ? `${ok} (${r.data.status})` : ok);
+      const st = r?.data?.status;
+      setMsg(st === 'queued' ? `${ok}: queued — a cycle is running and will flatten when it finishes` : st ? `${ok} (${st})` : ok);
       await load();
     } catch (e) {
       setMsg(errorMessage(e, 'Action failed'));
@@ -105,6 +112,14 @@ export default function BotPage() {
     );
   }
 
+  if (forbidden || !user.is_superuser) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: '#0a0b0d' }}>
+        <p style={{ color: '#9ba3b8' }}>The trading bot console is restricted to the administrator. <Link href="/dashboard" style={{ color: '#4fa3ff' }}>Back to dashboard</Link></p>
+      </div>
+    );
+  }
+
   const admin = user.is_superuser;
   const metrics = bt?.out_of_sample ?? bt?.metrics;
   const ddColor = (status?.drawdown_pct ?? 0) > 5 ? '#ff4757' : '#e8eaf0';
@@ -129,20 +144,31 @@ export default function BotPage() {
 
       {status?.halted && (
         <div className="flex items-center gap-2 p-3 rounded-xl" style={{ background: '#ff475715', border: '1px solid #ff475755', color: '#ff4757' }}>
-          <FiAlertTriangle /> <span className="text-sm">Halted by circuit breaker: {status.halt_reason}</span>
+          <FiAlertTriangle /> <span className="text-sm">Halted: {status.halt_reason}{status.flatten_requested ? ' — flatten pending (positions close at the next open market)' : ''}</span>
+        </div>
+      )}
+      {status && (status.stale || status.consecutive_failures > 0 || status.consecutive_data_faults > 0) && (
+        <div className="flex items-start gap-2 p-3 rounded-xl" style={{ background: '#ffd70012', border: '1px solid #ffd70055', color: '#ffd700' }}>
+          <FiAlertTriangle className="mt-0.5" />
+          <div className="text-sm space-y-0.5">
+            {status.stale && <p>No recent cycle{status.last_cycle_at ? ` since ${new Date(status.last_cycle_at).toLocaleString()}` : ''} — is the bot runner process running?</p>}
+            {status.consecutive_failures > 0 && <p>{status.consecutive_failures} consecutive failed cycle(s): {status.last_error}</p>}
+            {status.consecutive_data_faults > 0 && <p>Market data missing for held positions ({status.consecutive_data_faults} cycle(s)): entries paused, breakers frozen.</p>}
+          </div>
         </div>
       )}
 
       {/* Status + controls */}
       <div className={card}>
         <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
-          <Stat label="State" value={status?.halted ? 'HALTED' : status?.enabled ? 'RUNNING' : 'PAUSED'}
-            color={status?.halted ? '#ff4757' : status?.enabled ? '#00d4aa' : '#ffd700'} />
+          <Stat label="State" value={status?.halted ? 'HALTED' : status?.stale ? 'STALE' : status?.enabled ? 'RUNNING' : 'PAUSED'}
+            color={status?.halted ? '#ff4757' : status?.stale ? '#ffd700' : status?.enabled ? '#00d4aa' : '#ffd700'} />
           <Stat label="Equity" value={money(status?.equity)} />
           <Stat label="Cash" value={money(status?.cash)} />
           <Stat label="Drawdown" value={`${num(status?.drawdown_pct)}%`} color={ddColor} />
           <Stat label="Open positions" value={String(status?.open_positions ?? '—')} />
-          <Stat label="Last cycle" value={status?.last_cycle_at ? new Date(status.last_cycle_at).toLocaleTimeString() : '—'} />
+          <Stat label="Last cycle" value={status?.last_cycle_at ? new Date(status.last_cycle_at).toLocaleString() : '—'}
+            color={status?.stale ? '#ffd700' : '#e8eaf0'} />
         </div>
         {admin ? (
           <div className="flex flex-wrap gap-2">
@@ -194,6 +220,18 @@ export default function BotPage() {
               ))}
             </div>
           )}
+          <p className="text-xs font-semibold mt-4 mb-2" style={{ color: '#9ba3b8' }}>EDGE CALIBRATION</p>
+          {status?.calibration ? (
+            <div className="space-y-1 text-xs font-mono">
+              {[
+                ['Out-of-sample trades', String(status.calibration.trades)],
+                ['OOS expectancy', `${num(status.calibration.expectancy_r, 3)} R`],
+                ['OOS Sharpe / max DD', `${num(status.calibration.sharpe)} / ${num(status.calibration.max_drawdown_pct)}%`],
+              ].map(([k, v]) => (
+                <div key={k} className="flex justify-between"><span style={muted}>{k}</span><span style={text}>{v}</span></div>
+              ))}
+            </div>
+          ) : <p className="text-xs" style={{ color: '#ffd700' }}>Not calibrated: trades are half size, and broker trading is blocked. Run “Calibrate edge”.</p>}
           <p className="text-xs font-semibold mt-4 mb-2" style={{ color: '#9ba3b8' }}>REALISED PERFORMANCE</p>
           {perf?.trades ? (
             <div className="space-y-1 text-xs font-mono">

@@ -30,7 +30,7 @@ async def get_current_user(
     except (TypeError, ValueError):
         raise _UNAUTHORIZED
     user = await db.get(User, user_id)
-    if user is None or not user.is_active:
+    if user is None or not user.is_active or payload.get("ver", 0) != (user.token_version or 0):
         raise _UNAUTHORIZED
     return user
 

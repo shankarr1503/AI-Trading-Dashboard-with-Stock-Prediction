@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     # ─── Sentiment ───────────────────────────────────────────────────────────
     NEWS_API_KEY: str = ""
 
+    # ─── Accounts ────────────────────────────────────────────────────────────
+    # The account registering with this email becomes the administrator. If
+    # empty, only in development does the first account become admin;
+    # otherwise create one with `python -m backend.manage create-admin`.
+    BOOTSTRAP_ADMIN_EMAIL: str = ""
+    REGISTRATION_OPEN: bool = True
+
     # ─── CORS ────────────────────────────────────────────────────────────────
     # Comma-separated list. Kept as a plain string because pydantic-settings
     # JSON-decodes list fields before validators run.
@@ -63,6 +70,8 @@ class Settings(BaseSettings):
 
     # ─── Rate Limiting ───────────────────────────────────────────────────────
     RATE_LIMIT_DEFAULT: str = "120/minute"
+    # Peers allowed to set X-Real-IP (the reverse proxy). Defaults cover Docker networks and loopback.
+    TRUSTED_PROXY_CIDRS: str = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
     # ─── Trading bot ─────────────────────────────────────────────────────────
     # paper: simulated broker (default). alpaca_paper: Alpaca paper account.
@@ -74,6 +83,14 @@ class Settings(BaseSettings):
     BOT_UNIVERSE: str = "AAPL,MSFT,GOOGL,AMZN,NVDA,META,JPM,V,WMT,JNJ"
     BOT_INITIAL_CAPITAL: float = 100_000.0
     BOT_CYCLE_MINUTES: int = 15
+    # Manage positions the bot did not open (e.g. manual trades in the same
+    # broker account). Off by default: use a dedicated account for the bot.
+    BOT_ADOPT_EXTERNAL_POSITIONS: bool = False
+    # With a real broker, refuse to open positions until a walk-forward
+    # calibration with positive out-of-sample expectancy has been stored.
+    BOT_REQUIRE_CALIBRATION_FOR_BROKER: bool = True
+    # Operator alerts (kill switch, data faults, failed cycles) as JSON webhook.
+    ALERT_WEBHOOK_URL: str = ""
     # Optional LLM risk reviewer (Claude). Can only veto or shrink trades.
     LLM_REVIEW_ENABLED: bool = False
     # Empty → the SDK's default credential chain (env var, `ant auth login` profile, ...).
@@ -81,6 +98,16 @@ class Settings(BaseSettings):
     ANTHROPIC_MODEL: str = "claude-opus-5-5"
     # What to do if the reviewer errors out: "veto" (safe) or "approve".
     LLM_REVIEW_FAIL_MODE: str = "veto"
+
+    # ─── Equity research ─────────────────────────────────────────────────────
+    # Claude-written analyst reports (costs API credits; admins trigger new ones).
+    # Without it, reports come from the deterministic quant model.
+    RESEARCH_LLM_ENABLED: bool = False
+    # Let the analyst use Anthropic's server-side web search for current news/filings.
+    RESEARCH_WEB_SEARCH: bool = False
+    RESEARCH_REPORT_MAX_AGE_HOURS: int = 24
+    # Bot: no new entries this many calendar days before a scheduled earnings report.
+    EARNINGS_BLACKOUT_DAYS: int = 3
 
     @field_validator("DATABASE_URL")
     @classmethod
@@ -96,7 +123,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def check_production_safety(self) -> "Settings":
-        if self.APP_ENV.lower() in ("production", "prod", "staging"):
+        # Fail closed: anything that is not explicitly a dev/test environment, or
+        # that can touch a real broker, needs a strong secret.
+        if not self.is_development or self.TRADING_MODE != "paper":
             if self.JWT_SECRET_KEY == INSECURE_JWT_DEFAULT or len(self.JWT_SECRET_KEY) < 32:
                 raise ValueError(
                     "JWT_SECRET_KEY must be set to a random value of at least 32 characters "
@@ -114,7 +143,12 @@ class Settings(BaseSettings):
 
     @property
     def bot_universe(self) -> List[str]:
-        return [s.strip().upper() for s in self.BOT_UNIVERSE.split(",") if s.strip()]
+        seen: List[str] = []
+        for s in self.BOT_UNIVERSE.split(","):
+            s = s.strip().upper()
+            if s and s not in seen:
+                seen.append(s)
+        return seen
 
     @property
     def sync_database_url(self) -> str:

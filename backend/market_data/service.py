@@ -117,6 +117,13 @@ def _fetch_history_sync(symbol: str, period: str, interval: str) -> List[Dict[st
     ]
 
 
+def _fetch_splits_sync(symbol: str) -> List[Dict[str, Any]]:
+    splits = yf.Ticker(symbol).splits
+    if splits is None or len(splits) == 0:
+        return []
+    return [{"date": pd.Timestamp(ts).date().isoformat(), "ratio": float(r)} for ts, r in splits.items() if r and r > 0]
+
+
 def _fetch_news_sync(symbol: str) -> List[str]:
     items = yf.Ticker(symbol).news or []
     headlines = []
@@ -139,13 +146,16 @@ class MarketDataService:
         cached = await cache_get(key)
         if cached is not None:
             return cached
+        # Negative cache: unknown/broken symbols must not hit Yahoo on every request
+        # (that would get the shared egress IP rate-limited and blind the bot).
+        if await cache_get(f"quote_fail:{symbol}"):
+            raise ValueError(f"Could not fetch quote for '{symbol}' (recently failed)")
         try:
             async with _YF_SEMAPHORE:
                 quote = await asyncio.to_thread(_fetch_quote_sync, symbol)
-        except ValueError:
-            raise
         except Exception as e:
             logger.warning("Quote fetch failed for %s: %s", symbol, e)
+            await cache_set(f"quote_fail:{symbol}", True, 30)
             raise ValueError(f"Could not fetch quote for '{symbol}'") from e
         await cache_set(key, quote, CACHE_TTL["quote"])
         return quote
@@ -178,6 +188,18 @@ class MarketDataService:
         df = pd.DataFrame(records)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         return df.set_index("timestamp").astype(float)
+
+    async def get_splits(self, symbol: str) -> List[Dict[str, Any]]:
+        """Stock split history: [{"date": "YYYY-MM-DD", "ratio": 4.0}, ...] (cached 12h)."""
+        symbol = validate_symbol(symbol)
+        key = f"splits:{symbol}"
+        cached = await cache_get(key)
+        if cached is not None:
+            return cached
+        async with _YF_SEMAPHORE:
+            splits = await asyncio.to_thread(_fetch_splits_sync, symbol)
+        await cache_set(key, splits, 12 * 3600)
+        return splits
 
     async def get_news(self, symbol: str) -> List[str]:
         symbol = validate_symbol(symbol)

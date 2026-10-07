@@ -9,8 +9,9 @@ import PredictionPanel from '@/components/prediction/PredictionPanel';
 import PortfolioSummary from '@/components/portfolio/PortfolioSummary';
 import SentimentGauge from '@/components/sentiment/SentimentGauge';
 import TickerBar from '@/components/market/TickerBar';
+import ResearchReport from '@/components/research/ResearchReport';
 
-const TAB_ITEMS = ['Chart', 'Indicators', 'Portfolio', 'Sentiment'] as const;
+const TAB_ITEMS = ['Chart', 'Research', 'Indicators', 'Portfolio', 'Sentiment'] as const;
 type Tab = typeof TAB_ITEMS[number];
 
 export default function DashboardPage() {
@@ -58,6 +59,9 @@ export default function DashboardPage() {
               <CandlestickChart symbol={activeSymbol} />
             </div>
           )}
+
+          {/* Research Tab */}
+          {activeTab === 'Research' && <ResearchReport symbol={activeSymbol} />}
 
           {/* Indicators Tab */}
           {activeTab === 'Indicators' && (

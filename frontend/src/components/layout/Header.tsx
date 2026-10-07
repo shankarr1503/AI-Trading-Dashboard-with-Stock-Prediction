@@ -1,7 +1,7 @@
 'use client';
 import { useState, useCallback } from 'react';
 import Link from 'next/link';
-import { FiSearch, FiCpu, FiLogOut, FiUser } from 'react-icons/fi';
+import { FiSearch, FiCpu, FiFilter, FiLogOut, FiUser } from 'react-icons/fi';
 import { marketApi } from '@/lib/api';
 import { useAuth } from '@/lib/useAuth';
 
@@ -95,6 +95,11 @@ export default function Header({ onSymbolSelect, activeSymbol }: HeaderProps) {
           style={{ background: '#1a1d24', color: '#4fa3ff', border: '1px solid #1e2535' }}>
           {activeSymbol}
         </span>
+
+        <Link href="/research" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-white/5"
+          style={{ background: '#1a1d24', border: '1px solid #1e2535', color: '#9ba3b8' }}>
+          <FiFilter className="w-4 h-4" /> Research
+        </Link>
 
         <Link href="/bot" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-white/5"
           style={{ background: '#1a1d24', border: '1px solid #1e2535', color: '#9ba3b8' }}>

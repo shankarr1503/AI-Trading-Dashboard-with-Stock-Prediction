@@ -3,7 +3,7 @@ import enum
 
 from sqlalchemy import (
     JSON, BigInteger, Boolean, Column, DateTime, Enum, Float, ForeignKey, Index,
-    Integer, Numeric, String, Text, UniqueConstraint,
+    Integer, Numeric, String, Text, UniqueConstraint, false as sa_false,
 )
 from sqlalchemy.orm import relationship
 
@@ -26,6 +26,8 @@ class User(Base):
     full_name = Column(String(255))
     is_active = Column(Boolean, default=True, nullable=False)
     is_superuser = Column(Boolean, default=False, nullable=False)
+    # Bumped to revoke every outstanding token (logout everywhere / compromise).
+    token_version = Column(Integer, default=0, server_default="0", nullable=False)
     created_at = Column(TZDateTime, default=utcnow)
     updated_at = Column(TZDateTime, default=utcnow, onupdate=utcnow)
 
@@ -153,6 +155,13 @@ class BotState(Base):
     lease_owner = Column(String(64))
     lease_until = Column(TZDateTime)
     config_overrides = Column(JSON)
+    # Panic button: set by /flatten, executed by whichever process holds the lease.
+    flatten_requested = Column(Boolean, default=False, server_default=sa_false(), nullable=False)
+    consecutive_failures = Column(Integer, default=0, server_default="0", nullable=False)
+    consecutive_data_faults = Column(Integer, default=0, server_default="0", nullable=False)
+    last_error = Column(Text)
+    last_success_at = Column(TZDateTime)
+    cashflow_checked_at = Column(TZDateTime)
     updated_at = Column(TZDateTime, default=utcnow, onupdate=utcnow)
 
 
@@ -266,3 +275,27 @@ class BotCalibration(Base):
     symbol = Column(String(20), primary_key=True)
     stats = Column(JSON, nullable=False)
     updated_at = Column(TZDateTime, default=utcnow, onupdate=utcnow)
+
+
+# ─── Equity research ──────────────────────────────────────────────────────────
+
+class ResearchReport(Base):
+    """A stored analyst report (Claude or rules-based) with its headline numbers."""
+    __tablename__ = "research_reports"
+    __table_args__ = (Index("ix_research_reports_symbol_created", "symbol", "created_at"),)
+
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    created_at = Column(TZDateTime, default=utcnow, nullable=False)
+    source = Column(String(20), nullable=False)          # claude | quant_model
+    model = Column(String(64))
+    rating = Column(String(12), nullable=False)
+    conviction = Column(Integer)
+    price = Column(Money)
+    expected_price = Column(Money)
+    expected_return_pct = Column(Float)
+    composite_score = Column(Float)
+    fair_value = Column(Money)
+    report = Column(JSON, nullable=False)
+    usage = Column(JSON)
+    requested_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))

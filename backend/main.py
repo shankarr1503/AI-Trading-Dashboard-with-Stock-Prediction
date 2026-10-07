@@ -23,6 +23,7 @@ from backend.market_data.websocket import router as ws_router
 from backend.portfolio.router import router as portfolio_router
 from backend.predictions.router import router as predictions_router
 from backend.ratelimit import limiter
+from backend.research.router import router as research_router
 from backend.signals.router import router as signals_router
 from backend.trading.router import router as bot_router
 
@@ -93,6 +94,7 @@ app.include_router(signals_router, prefix="/api/signals", tags=["Trade Signals"]
 app.include_router(portfolio_router, prefix="/api/portfolio", tags=["Portfolio"])
 app.include_router(alerts_router, prefix="/api/alerts", tags=["Alerts"])
 app.include_router(bot_router, prefix="/api/bot", tags=["Trading Bot"])
+app.include_router(research_router, prefix="/api/research", tags=["Equity Research"])
 
 
 @app.get("/health", tags=["Health"])

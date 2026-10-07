@@ -36,6 +36,7 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://test_user:test_password@localhost:5432/test_trading
         run: |
           alembic upgrade head
+          alembic check            # models and migrations must not drift
           alembic downgrade base
           alembic upgrade head
 

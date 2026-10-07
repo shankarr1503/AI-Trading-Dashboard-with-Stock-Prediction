@@ -54,6 +54,8 @@ class FakeMarket:
     def __init__(self, frames: dict):
         self.frames = frames
         self.price_override: dict = {}
+        self.splits: dict = {}
+        self.quote_failures: set = set()
 
     async def get_history_df(self, symbol, period="1y", interval="1d"):
         if symbol not in self.frames:
@@ -66,7 +68,7 @@ class FakeMarket:
                  "volume": int(row["volume"])} for ts, row in df.iterrows()]
 
     async def get_quote(self, symbol):
-        if symbol not in self.frames:
+        if symbol not in self.frames or symbol in self.quote_failures:
             raise ValueError(f"No quote for {symbol}")
         df = self.frames[symbol]
         price = self.price_override.get(symbol, float(df["close"].iloc[-1]))
@@ -85,6 +87,19 @@ class FakeMarket:
 
     async def get_news(self, symbol):
         return []
+
+    async def get_splits(self, symbol):
+        return self.splits.get(symbol, [])
+
+
+class FakeResearch:
+    """Stands in for ResearchService.fundamental_view."""
+
+    def __init__(self, views: dict | None = None):
+        self.views = views or {}
+
+    async def fundamental_view(self, symbol):
+        return self.views.get(symbol, {"available": False})
 
 
 class FakePredictor:

@@ -159,6 +159,12 @@ class LLMReviewer:
         return Verdict("veto", 0.0, f"Reviewer unavailable ({why}); vetoed per fail mode", source="fail_safe")
 
     async def review(self, proposal: dict, tool_handler: ToolHandler) -> Verdict:
+        try:
+            return await self._review(proposal, tool_handler)
+        except Exception as e:  # any failure (auth resolution, SDK bugs, bad data) → fail mode, never a crash
+            return self._fail_safe(f"{type(e).__name__}: {str(e)[:120]}")
+
+    async def _review(self, proposal: dict, tool_handler: ToolHandler) -> Verdict:
         import anthropic
 
         client = self._get_client()

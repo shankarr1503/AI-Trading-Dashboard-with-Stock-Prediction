@@ -33,11 +33,14 @@ class SignalService:
         cfg = StrategyConfig()
         df = await market_data_service.get_history_df(symbol, period="2y", interval="1d")
         frame = await asyncio.to_thread(compute_factor_frame, df, cfg)
-        prediction, sentiment = await asyncio.gather(
+        from backend.research.service import research_service
+
+        prediction, sentiment, fundamental = await asyncio.gather(
             _optional(prediction_service.predict(symbol)),
             _optional(prediction_service.sentiment(symbol)),
+            _optional(research_service.fundamental_view(symbol)),
         )
-        a = analyze_latest(symbol, frame, cfg, ml=prediction, sentiment=sentiment)
+        a = analyze_latest(symbol, frame, cfg, ml=prediction, sentiment=sentiment, fundamental=fundamental)
 
         from backend.database.session import AsyncSessionLocal
         from backend.trading.agent import load_calibrator
@@ -47,11 +50,13 @@ class SignalService:
                 calibrator = await load_calibrator(db, symbol)
         except Exception:
             calibrator = Calibrator()
-        edge = calibrator.estimate(a.score)
+        # Same convention as the live bot: edge is estimated from the validated
+        # technical score; calibrated estimates are net of costs, the prior is gross.
+        edge = calibrator.estimate(a.tech_score)
         cm = cost_model_for(symbol)
         risk_pct = (a.price - a.stop) / a.price
-        expected_edge_pct = edge.ev_r * risk_pct
         cost_pct = cm.round_trip_cost_pct(a.price)
+        expected_edge_pct = edge.ev_r * risk_pct + (cost_pct if edge.net_of_costs else 0.0)
         worth_it = a.signal == "BUY" and expected_edge_pct >= 2 * cost_pct and edge.ev_r > 0
 
         current = {k: (None if v != v else v) for k, v in frame.iloc[-1].items() if isinstance(v, (int, float))}
@@ -60,6 +65,7 @@ class SignalService:
             "symbol": symbol,
             "signal": a.signal,
             "score": a.score,
+            "technical_score": a.tech_score,
             "confidence": round(abs(a.score), 3),
             "confidence_pct": round(abs(a.score) * 100, 1),
             "regime": a.regime,
@@ -82,6 +88,7 @@ class SignalService:
                     "source": (prediction or {}).get("source"),
                 },
                 "sentiment": sentiment,
+                "fundamentals": fundamental,
             },
             "disclaimer": "Signals are for educational analysis only and are not financial advice.",
         }

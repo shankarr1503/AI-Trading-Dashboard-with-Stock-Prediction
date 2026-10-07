@@ -27,15 +27,22 @@ async def main() -> None:
             pass
 
     interval = max(1, settings.BOT_CYCLE_MINUTES) * 60
+    if settings.LLM_REVIEW_ENABLED and not settings.ANTHROPIC_API_KEY:
+        logger.warning("LLM_REVIEW_ENABLED=true but ANTHROPIC_API_KEY is empty: reviews will use the fail mode (%s)",
+                       settings.LLM_REVIEW_FAIL_MODE)
+    if not settings.ALERT_WEBHOOK_URL:
+        logger.warning("ALERT_WEBHOOK_URL is not set: kill-switch and failure alerts only go to the log")
     logger.info("Trading runner started: mode=%s, universe=%s, every %d min, LLM review=%s",
                 settings.TRADING_MODE, ",".join(settings.bot_universe), interval // 60, settings.LLM_REVIEW_ENABLED)
     while not stop.is_set():
+        # A cycle always finishes (it never raises); SIGTERM only stops the loop
+        # between cycles, so a deploy cannot interrupt an order mid-flight.
         try:
             summary = await agent.run_cycle()
             logger.info("Cycle %s: %s", summary.get("cycle_id"),
-                        {k: summary.get(k) for k in ("status", "equity", "entries", "exits", "skipped")})
+                        {k: summary.get(k) for k in ("status", "equity", "entries", "exits", "skipped", "error")})
         except Exception:
-            logger.exception("Cycle failed; will retry next interval")
+            logger.exception("Cycle failed unexpectedly; will retry next interval")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except asyncio.TimeoutError:

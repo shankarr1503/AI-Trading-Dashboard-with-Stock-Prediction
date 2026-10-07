@@ -39,6 +39,9 @@ class StrategyConfig:
     trail_atr_mult: float = 3.0
     breakeven_after_atr: float = 1.5     # move stop to breakeven after +1.5 ATR
     max_holding_bars: int = 40
+    # Skip an entry if price has moved more than this many ATRs away from the
+    # signal bar's close by the time the order would execute.
+    gap_filter_atr: float = 2.0
     min_history: int = 210
     adx_threshold: float = 22.0
     high_vol_percentile: float = 0.90
@@ -47,11 +50,14 @@ class StrategyConfig:
         return asdict(self)
 
 
+# Technical weights drive the validated (backtested) tech_score. The ml,
+# sentiment and fundamental overlays only enter the blended `score`, which the
+# live bot uses solely to *block* trades, never to create them.
 REGIME_WEIGHTS: Dict[Regime, Dict[str, float]] = {
-    Regime.BULL_TREND: {"trend": 0.35, "momentum": 0.25, "meanrev": 0.10, "volume": 0.10, "ml": 0.15, "sentiment": 0.05},
-    Regime.BEAR_TREND: {"trend": 0.35, "momentum": 0.25, "meanrev": 0.10, "volume": 0.10, "ml": 0.15, "sentiment": 0.05},
-    Regime.RANGE: {"trend": 0.10, "momentum": 0.10, "meanrev": 0.40, "volume": 0.10, "ml": 0.20, "sentiment": 0.10},
-    Regime.HIGH_VOLATILITY: {"trend": 0.20, "momentum": 0.15, "meanrev": 0.25, "volume": 0.10, "ml": 0.20, "sentiment": 0.10},
+    Regime.BULL_TREND: {"trend": 0.35, "momentum": 0.25, "meanrev": 0.10, "volume": 0.10, "ml": 0.15, "sentiment": 0.05, "fundamental": 0.10},
+    Regime.BEAR_TREND: {"trend": 0.35, "momentum": 0.25, "meanrev": 0.10, "volume": 0.10, "ml": 0.15, "sentiment": 0.05, "fundamental": 0.10},
+    Regime.RANGE: {"trend": 0.10, "momentum": 0.10, "meanrev": 0.40, "volume": 0.10, "ml": 0.20, "sentiment": 0.10, "fundamental": 0.10},
+    Regime.HIGH_VOLATILITY: {"trend": 0.20, "momentum": 0.15, "meanrev": 0.25, "volume": 0.10, "ml": 0.20, "sentiment": 0.10, "fundamental": 0.10},
 }
 TECH_FACTORS = ("trend", "momentum", "meanrev", "volume")
 
@@ -174,6 +180,13 @@ def ml_factor(ml: Optional[dict]) -> Optional[float]:
     return float(_clip((float(p_up) - 0.5) * 4))
 
 
+def fundamental_factor(view: Optional[dict]) -> Optional[float]:
+    """Research scorecard composite (0–100) → [-1, 1]; ignored when coverage is thin."""
+    if not view or not view.get("available") or view.get("composite") is None or (view.get("coverage") or 0) < 0.5:
+        return None
+    return float(_clip((float(view["composite"]) - 50) / 50))
+
+
 def sentiment_factor(sentiment: Optional[dict]) -> Optional[float]:
     if not sentiment or sentiment.get("headlines_analyzed", 0) < 3:
         return None
@@ -191,8 +204,12 @@ def analyze_latest(
     cfg: Optional[StrategyConfig] = None,
     ml: Optional[dict] = None,
     sentiment: Optional[dict] = None,
+    fundamental: Optional[dict] = None,
 ) -> Analysis:
-    """Analysis of the latest bar of a factor frame, optionally blending ML and sentiment."""
+    """
+    Analysis of the latest bar. `tech_score` is the backtested technical signal;
+    `score` additionally blends the ML, sentiment and fundamental overlays.
+    """
     cfg = cfg or StrategyConfig()
     if len(frame) < cfg.min_history:
         raise ValueError(f"{symbol}: need {cfg.min_history} bars of history, have {len(frame)}")
@@ -207,6 +224,7 @@ def analyze_latest(
         "trend": row["trend"], "momentum": row["momentum"],
         "meanrev": row["meanrev"], "volume": row["volume_flow"],
         "ml": ml_factor(ml), "sentiment": sentiment_factor(sentiment),
+        "fundamental": fundamental_factor(fundamental),
     }
     weights = REGIME_WEIGHTS[regime]
     components: Dict[str, Dict[str, Any]] = {}
@@ -222,15 +240,17 @@ def analyze_latest(
     stop, target = stop_and_target(price, atr, regime.value, cfg)
     reward_risk = (target - price) / (price - stop)
 
+    tech = float(row["tech_score"]) if not math.isnan(row["tech_score"]) else 0.0
     threshold = cfg.entry_threshold + (cfg.bear_entry_penalty if regime == Regime.BEAR_TREND else 0.0)
-    if score >= threshold:
+    # BUY needs the validated technical signal AND no overlay veto.
+    if tech >= threshold and score >= threshold:
         signal = "BUY"
-    elif score <= cfg.exit_threshold:
+    elif tech <= cfg.exit_threshold:
         signal = "SELL"
     else:
         signal = "HOLD"
 
-    reasons = [f"Regime {regime.value}; composite score {score:+.2f} (entry ≥ {threshold:.2f})"]
+    reasons = [f"Regime {regime.value}; technical score {tech:+.2f}, blended {score:+.2f} (entry ≥ {threshold:.2f})"]
     for name, comp in components.items():
         if comp["score"] is not None:
             reasons.append(f"{name}: {comp['score']:+.2f} × w{comp['weight']:.2f}")
@@ -243,7 +263,7 @@ def analyze_latest(
         atr_pct=round(atr / price, 5),
         regime=regime.value,
         score=round(score, 4),
-        tech_score=round(float(row["tech_score"]), 4) if not math.isnan(row["tech_score"]) else 0.0,
+        tech_score=round(tech, 4),
         components=components,
         signal=signal,
         stop=round(stop, 4),

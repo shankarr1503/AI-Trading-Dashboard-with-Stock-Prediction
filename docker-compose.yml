@@ -1,7 +1,8 @@
 # Full stack: Postgres, Redis, API, trading-bot runner, ML service, frontend, nginx.
 # Open http://localhost after `docker compose up --build`.
 x-backend-env: &backend-env
-  APP_ENV: ${APP_ENV:-production}
+  # Hard-coded: the Docker stack always runs with production safety checks.
+  APP_ENV: production
   DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading_user}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-trading_platform}
   REDIS_URL: redis://redis:6379/0
   ML_SERVICE_URL: http://ml_service:8001
@@ -48,7 +49,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: sh -c "alembic upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 4 --proxy-headers"
+    command: sh -c "alembic upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 4"
 
   # Exactly one process drives the trading bot (a DB lease also prevents doubles).
   bot:
@@ -62,17 +63,26 @@ services:
       backend:
         condition: service_healthy
     command: python -m backend.trading.runner
+    # Let an in-flight cycle finish on deploys instead of killing it mid-order.
+    stop_grace_period: 180s
     healthcheck:
-      disable: true
+      test: ["CMD", "python", "-m", "backend.trading.healthcheck"]
+      interval: 60s
+      timeout: 20s
+      start_period: 120s
+      retries: 3
 
   ml_service:
     build:
       context: .
       dockerfile: deployment/Dockerfile.ml
     restart: unless-stopped
-    env_file: .env
+    # Only what the ML service needs — not the broker/LLM/JWT secrets in .env.
     environment:
       MODEL_SAVE_DIR: /app/ml/saved_models
+      NEWS_API_KEY: ${NEWS_API_KEY:-}
+      ML_SERVICE_API_KEY: ${ML_SERVICE_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ml_models:/app/ml/saved_models
 
