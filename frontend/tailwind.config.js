@@ -38,8 +38,9 @@ module.exports = {
         },
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', 'sans-serif'],
-        mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+        // Self-hosted by next/font (see app/layout.tsx): no runtime requests to Google.
+        sans: ['var(--font-inter)', 'system-ui', 'sans-serif'],
+        mono: ['var(--font-mono)', 'Fira Code', 'monospace'],
       },
       boxShadow: {
         'glow-green': '0 0 20px rgba(0, 212, 170, 0.15)',

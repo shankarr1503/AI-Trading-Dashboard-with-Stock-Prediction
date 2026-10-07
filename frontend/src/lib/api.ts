@@ -4,8 +4,19 @@
  */
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000';
+// NEXT_PUBLIC_SAME_ORIGIN=true (the desktop build) means the page is served by the API server
+// itself: requests use relative URLs and the WebSocket base is derived from the page's origin
+// when a socket is opened. Otherwise the API lives at NEXT_PUBLIC_API_URL / NEXT_PUBLIC_WS_URL.
+const SAME_ORIGIN = process.env.NEXT_PUBLIC_SAME_ORIGIN === 'true';
+const API_URL = SAME_ORIGIN ? '' : process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const WS_URL = SAME_ORIGIN ? '' : process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000';
+
+/** WebSocket base URL (no trailing slash): ws(s)://<page host> in same-origin mode, else WS_URL. */
+export function wsBaseUrl(): string {
+  if (!SAME_ORIGIN || typeof window === 'undefined') return WS_URL;
+  const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${scheme}//${window.location.host}`;
+}
 
 const ACCESS_KEY = 'access_token';
 const REFRESH_KEY = 'refresh_token';
@@ -184,7 +195,7 @@ export const researchApi = {
 
 // WebSocket factory
 export const createPriceWebSocket = (symbol: string, onMessage: (data: any) => void): WebSocket => {
-  const ws = new WebSocket(`${WS_URL}/ws/market/${enc(symbol)}?token=${enc(tokens.access ?? '')}`);
+  const ws = new WebSocket(`${wsBaseUrl()}/ws/market/${enc(symbol)}?token=${enc(tokens.access ?? '')}`);
   ws.onmessage = (event) => {
     try {
       onMessage(JSON.parse(event.data));
@@ -195,4 +206,5 @@ export const createPriceWebSocket = (symbol: string, onMessage: (data: any) => v
   return ws;
 };
 
+// Both are '' in same-origin mode: prefix paths with API_URL, and build socket URLs with wsBaseUrl().
 export { API_URL, WS_URL };

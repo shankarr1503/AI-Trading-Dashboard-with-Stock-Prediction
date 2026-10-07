@@ -1,0 +1,16 @@
+# Keep the Docker build context small and reproducible: images install their own
+# dependencies, and local build outputs must never overwrite them.
+.git
+**/node_modules
+**/.next
+frontend/out
+desktop/dist
+dist-backend
+build-backend
+extension/dist
+**/__pycache__
+**/*.py[cod]
+.venv
+venv
+*.db
+.env

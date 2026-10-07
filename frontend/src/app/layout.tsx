@@ -1,8 +1,13 @@
 import type { Metadata } from 'next';
-import { Inter } from 'next/font/google';
+import { Inter, JetBrains_Mono } from 'next/font/google';
 import '../styles/globals.css';
 
+// next/font downloads the fonts at build time and serves them from /_next/static/media, so the
+// app (including the offline desktop build) never needs Google's font servers at runtime.
+// `--font-inter` / `--font-mono` let CSS and Tailwind refer to the self-hosted families.
 const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
+// Not preloaded: only the numeric widgets use it, and a preload on pages without them is wasted.
+const mono = JetBrains_Mono({ subsets: ['latin'], variable: '--font-mono', preload: false });
 
 export const metadata: Metadata = {
   title: 'AI Trading Platform — Real-Time Market Analytics & Predictions',
@@ -14,13 +19,12 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={inter.variable}>
+    <html lang="en" className={`${inter.variable} ${mono.variable}`}>
       <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
         <meta name="theme-color" content="#0a0b0d" />
       </head>
-      <body className="bg-bg-primary text-text-primary antialiased">
+      <body className={`${inter.className} bg-bg-primary text-text-primary antialiased`}>
         {children}
       </body>
     </html>
