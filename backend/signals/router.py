@@ -1,27 +1,27 @@
 """Signals router."""
+import logging
+
 from fastapi import APIRouter, HTTPException
+
 from backend.signals.service import signal_service
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/{symbol}")
 async def get_signal(symbol: str):
     """
-    Get AI-driven trade signal for a stock symbol.
+    BUY / SELL / HOLD signal from regime-weighted technical factors, the ML
+    forecast and news sentiment — with stop, target, expectancy and a check
+    that the expected edge clears round-trip transaction costs.
 
-    Aggregates:
-    - Technical indicator signals (RSI, MACD, Bollinger, EMA, Stochastic)
-    - ML price prediction (direction + confidence)
-    - Market sentiment (FinBERT NLP score)
-
-    Returns BUY / SELL / HOLD with entry price, target, stop-loss, and confidence.
-
-    ⚠️ DISCLAIMER: For educational analysis only. Not financial advice.
+    DISCLAIMER: For educational analysis only. Not financial advice.
     """
     try:
-        return await signal_service.generate_signal(symbol.upper())
+        return await signal_service.generate_signal(symbol)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Signal generation failed: {e}")
+    except Exception:
+        logger.exception("Signal generation failed for %s", symbol)
+        raise HTTPException(status_code=500, detail="Signal generation failed")

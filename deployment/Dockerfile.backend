@@ -1,31 +1,25 @@
-# ─── Backend Dockerfile ──────────────────────────────────────
+# ─── Backend (FastAPI API + trading bot runner) ──────────────
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libpq-dev \
-    curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
 COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
+RUN pip install -r backend/requirements.txt
 
-# Copy application source
+COPY alembic.ini /app/alembic.ini
+COPY shared/ /app/shared/
 COPY backend/ /app/backend/
-COPY .env.example /app/.env.example
+COPY data_pipeline/ /app/data_pipeline/
 
-# Create non-root user
 RUN adduser --disabled-password --gecos '' appuser && chown -R appuser /app
 USER appuser
 
 EXPOSE 8000
-
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -fsS http://localhost:8000/health || exit 1
 
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers"]

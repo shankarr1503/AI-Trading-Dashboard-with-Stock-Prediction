@@ -1,213 +1,200 @@
 """
-Ensemble Predictor — aggregates LSTM, XGBoost, and ARIMA predictions
-into a single consensus forecast with weighted confidence scoring.
+Ensemble predictor — combines LSTM, XGBoost and ARIMA next-day return forecasts.
+
+Each symbol gets its own predictor instance (previously a single shared
+instance meant symbol B could be scored with symbol A's models). Models are
+weighted by out-of-sample skill (holdout RMSE relative to a naive zero-return
+forecast). The up/down probability is P(r > 0) under a normal approximation
+with the ensemble mean and recent realised volatility — which is usually close
+to 50%, because next-day returns are mostly noise. That is the honest answer.
 """
 import logging
+import math
 import os
+import threading
+from collections import OrderedDict
+from typing import Any, Dict, Optional
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from typing import Dict, Any, Optional
 
-from ml.feature_engineering.pipeline import build_features
-from ml.models.lstm_model import LSTMStockPredictor
-from ml.models.xgboost_model import XGBoostPredictor
+from ml.feature_engineering.pipeline import FEATURE_COLUMNS, build_features
 from ml.models.arima_model import ARIMAPredictor
-from ml.evaluation.metrics import compute_metrics
+from ml.models.lstm_model import TF_AVAILABLE, LSTMStockPredictor
+from ml.models.xgboost_model import XGBoostPredictor
 
 logger = logging.getLogger(__name__)
 
-# Model weights for ensemble (higher = more influence)
-MODEL_WEIGHTS = {
-    "LSTM": 0.40,
-    "XGBoost": 0.35,
-    "ARIMA": 0.25,
-}
+MODEL_DIR = os.environ.get("MODEL_SAVE_DIR", "ml/saved_models")
+DISCLAIMER = (
+    "AI predictions are for educational analysis only. Markets are inherently unpredictable; "
+    "do not base financial decisions solely on these outputs."
+)
 
-# Feature columns used by tabular models (LSTM + XGBoost)
-TABULAR_FEATURES = [
-    "close", "return_1d", "return_5d", "return_10d", "log_return_1d",
-    "sma_10", "sma_20", "ema_10", "ema_20", "rsi_14", "rsi_7",
-    "macd", "macd_signal", "macd_hist",
-    "bb_upper", "bb_lower", "bb_bandwidth", "bb_pct",
-    "atr_14", "volatility_10d", "volatility_20d",
-    "volume_ratio", "daily_range_pct",
-    "stoch_k", "stoch_d", "willr",
-]
+
+def _normal_cdf(x: float) -> float:
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def fetch_ohlcv(symbol: str, period: str = "5y") -> pd.DataFrame:
+    df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=True)
+    if df is None or df.empty:
+        raise ValueError(f"No data for {symbol}")
+    df.columns = df.columns.str.lower()
+    return df[["open", "high", "low", "close", "volume"]].dropna()
 
 
 class EnsemblePredictor:
-    """Weighted ensemble of LSTM + XGBoost + ARIMA for stock price prediction."""
+    """All models for ONE symbol."""
 
-    def __init__(self, model_dir: str = "ml/saved_models"):
-        self.model_dir = model_dir
-        from ml.models.lstm_model import TF_AVAILABLE
-        self.lstm = LSTMStockPredictor(sequence_length=60) if TF_AVAILABLE else None
+    def __init__(self, symbol: str, model_dir: str = MODEL_DIR):
+        self.symbol = symbol.upper()
+        self.base = os.path.join(model_dir, self.symbol)
+        self.lstm = LSTMStockPredictor() if TF_AVAILABLE else None
         self.xgb = XGBoostPredictor()
         self.arima = ARIMAPredictor()
-        self.models_loaded = False
+        self.lock = threading.Lock()
+        self._load()
 
-    def _fetch_data(self, symbol: str, period: str = "2y") -> pd.DataFrame:
-        """Fetch OHLCV from Yahoo Finance and compute features."""
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval="1d", auto_adjust=True)
-        df.columns = df.columns.str.lower()
-        df = df[["open", "high", "low", "close", "volume"]].dropna()
-        df = build_features(df)
-        return df
+    def _models(self):
+        return [m for m in (self.lstm, self.xgb, self.arima) if m is not None]
 
-    def train_all(self, symbol: str):
-        """Train all three models on historical data for the given symbol."""
-        logger.info(f"Starting ensemble training for {symbol}...")
-        df = self._fetch_data(symbol)
+    def _load(self) -> None:
+        for model, sub in ((self.lstm, "lstm"), (self.xgb, "xgb"), (self.arima, "arima")):
+            if model is None:
+                continue
+            path = os.path.join(self.base, sub)
+            if os.path.isdir(path):
+                try:
+                    model.load(path)
+                except Exception as e:
+                    logger.warning("Could not load %s for %s: %s", sub, self.symbol, e)
 
-        # Filter available feature columns
-        available_features = [f for f in TABULAR_FEATURES if f in df.columns]
+    def train_all(self, period: str = "5y") -> Dict[str, Any]:
+        df = build_features(fetch_ohlcv(self.symbol, period))
+        report: Dict[str, Any] = {}
+        with self.lock:
+            for model, sub in ((self.lstm, "lstm"), (self.xgb, "xgb"), (self.arima, "arima")):
+                if model is None:
+                    report["LSTM"] = "skipped (TensorFlow not installed)"
+                    continue
+                try:
+                    if isinstance(model, ARIMAPredictor):
+                        report[model.name] = model.train(df)
+                    else:
+                        report[model.name] = model.train(df, FEATURE_COLUMNS)
+                    model.save(os.path.join(self.base, sub))
+                except Exception as e:
+                    logger.error("%s training failed for %s: %s", model.name, self.symbol, e)
+                    report[model.name] = f"failed: {e}"
+        return report
 
-        # Train LSTM
-        if self.lstm:
+    @staticmethod
+    def _weight(model) -> float:
+        skill = (getattr(model, "metrics", {}) or {}).get("rmse_vs_naive")
+        if not skill:
+            return 1.0
+        return 1.0 / max(skill, 0.5) ** 2
+
+    def predict(self) -> Dict[str, Any]:
+        raw = fetch_ohlcv(self.symbol, "2y")
+        df = build_features(raw)
+        if df.empty:
+            raise ValueError(f"Not enough history for {self.symbol}")
+        current = float(raw["close"].iloc[-1])
+        log_ret = np.log(raw["close"]).diff().dropna()
+        sigma = float(log_ret.iloc[-60:].std()) or 1e-4
+
+        preds: Dict[str, Dict[str, Any]] = {}
+        with self.lock:
+            for model in self._models():
+                if model is not self.arima and not model.is_trained:
+                    continue
+                try:
+                    r = model.predict_return(df)
+                    preds[model.name] = {"return": r, "weight": self._weight(model), "metrics": getattr(model, "metrics", {})}
+                except Exception as e:
+                    logger.warning("%s predict failed for %s: %s", model.name, self.symbol, e)
             try:
-                logger.info("Training LSTM...")
-                self.lstm.train(df, available_features, epochs=50, batch_size=32)
-                self.lstm.save(os.path.join(self.model_dir, symbol, "lstm"))
-            except Exception as e:
-                logger.error(f"LSTM training failed: {e}")
-        else:
-            logger.warning("Skipping LSTM training (TensorFlow missing)")
-
-        # Train XGBoost
-        try:
-            logger.info("Training XGBoost...")
-            self.xgb.train(df, available_features)
-            self.xgb.save(os.path.join(self.model_dir, symbol, "xgb"))
-        except Exception as e:
-            logger.error(f"XGBoost training failed: {e}")
-
-        # Train ARIMA
-        try:
-            logger.info("Training ARIMA...")
-            self.arima.train(df)
-            self.arima.save(os.path.join(self.model_dir, symbol, "arima"))
-        except Exception as e:
-            logger.error(f"ARIMA training failed: {e}")
-
-        logger.info(f"Ensemble training complete for {symbol}")
-
-    def load_all(self, symbol: str) -> bool:
-        """Load pre-trained models from disk."""
-        base = os.path.join(self.model_dir, symbol)
-        loaded = False
-        if self.lstm:
-            try:
-                self.lstm.load(os.path.join(base, "lstm"))
-                loaded = True
+                week_path = self.arima.forecast_returns(df, steps=5)
             except Exception:
-                pass
-        try:
-            self.xgb.load(os.path.join(base, "xgb"))
-            loaded = True
-        except Exception:
-            pass
-        try:
-            self.arima.load(os.path.join(base, "arima"))
-            loaded = True
-        except Exception:
-            pass
-        self.models_loaded = loaded
-        return loaded
+                week_path = None
+        if not preds:
+            raise RuntimeError("All models failed to predict")
 
-    def predict(self, symbol: str, use_cache: bool = True) -> Dict[str, Any]:
-        """
-        Generate ensemble prediction for a symbol.
-        Auto-loads trained models if available, otherwise falls back to ARIMA only.
-        """
-        symbol = symbol.upper()
-
-        if use_cache:
-            self.load_all(symbol)
-
-        df = self._fetch_data(symbol)
-        available_features = [f for f in TABULAR_FEATURES if f in df.columns]
-        current_price = float(df["close"].iloc[-1])
-
-        model_preds = {}
-
-        # LSTM prediction
-        if self.lstm and self.lstm.is_trained:
-            try:
-                model_preds["LSTM"] = self.lstm.predict(df)
-            except Exception as e:
-                logger.warning(f"LSTM predict failed: {e}")
-
-        # XGBoost prediction
-        if self.xgb.is_trained:
-            try:
-                model_preds["XGBoost"] = self.xgb.predict(df)
-            except Exception as e:
-                logger.warning(f"XGBoost predict failed: {e}")
-
-        # ARIMA prediction (always attempt)
-        try:
-            model_preds["ARIMA"] = self.arima.predict(df)
-        except Exception as e:
-            logger.warning(f"ARIMA predict failed: {e}")
-
-        if not model_preds:
-            raise RuntimeError("All models failed to predict.")
-
-        # ── Weighted Ensemble ──────────────────────────────────────────────────
-        total_weight = 0
-        weighted_sum = 0
-        for model_name, pred in model_preds.items():
-            w = MODEL_WEIGHTS.get(model_name, 0.33)
-            weighted_sum += pred["predicted_price"] * w
-            total_weight += w
-
-        ensemble_price = weighted_sum / total_weight if total_weight > 0 else current_price
-        change_pct = (ensemble_price - current_price) / current_price * 100
-        direction = "BULLISH" if change_pct > 0 else "BEARISH"
-
-        # Confidence: inversely proportional to model disagreement
-        pred_prices = [p["predicted_price"] for p in model_preds.values()]
-        std_of_preds = float(np.std(pred_prices)) if len(pred_prices) > 1 else 0
-        disagreement_pct = (std_of_preds / current_price) * 100
-        confidence = max(0.35, min(0.90, 1.0 - disagreement_pct / 5))
-
-        bullish_prob = confidence if direction == "BULLISH" else round(1 - confidence, 3)
-        bearish_prob = confidence if direction == "BEARISH" else round(1 - confidence, 3)
+        total_w = sum(p["weight"] for p in preds.values())
+        mu = sum(p["return"] * p["weight"] for p in preds.values()) / total_w
+        mu_week = float(np.sum(week_path)) if week_path is not None else mu * 5
+        p_up = _normal_cdf(mu / sigma)
+        p_up_week = _normal_cdf(mu_week / (sigma * math.sqrt(5)))
+        next_day = current * math.exp(mu)
+        next_week = current * math.exp(mu_week)
+        direction = "BULLISH" if mu > 0 else "BEARISH" if mu < 0 else "NEUTRAL"
+        agreement = np.mean([np.sign(p["return"]) == np.sign(mu) for p in preds.values()])
 
         return {
-            "symbol": symbol,
-            "current_price": round(current_price, 4),
+            "symbol": self.symbol,
+            "current_price": round(current, 4),
             "predictions": {
                 "next_day": {
-                    "price": round(ensemble_price, 4),
-                    "change": round(ensemble_price - current_price, 4),
-                    "change_pct": round(change_pct, 4),
+                    "price": round(next_day, 4),
+                    "change": round(next_day - current, 4),
+                    "change_pct": round((math.exp(mu) - 1) * 100, 4),
                     "direction": direction,
-                    "confidence": round(confidence, 3),
-                    "bullish_probability": round(bullish_prob, 3),
-                    "bearish_probability": round(bearish_prob, 3),
+                    "confidence": round(abs(p_up - 0.5) * 2, 3),
+                    "bullish_probability": round(p_up, 3),
+                    "bearish_probability": round(1 - p_up, 3),
+                    "expected_volatility_pct": round(sigma * 100, 3),
+                    "model_agreement": round(float(agreement), 3),
+                },
+                "next_week": {
+                    "price": round(next_week, 4),
+                    "change_pct": round((math.exp(mu_week) - 1) * 100, 4),
+                    "direction": "BULLISH" if mu_week > 0 else "BEARISH",
+                    "bullish_probability": round(p_up_week, 3),
                 },
             },
             "model_breakdown": {
                 name: {
-                    "predicted_price": pred["predicted_price"],
-                    "change_pct": pred["change_pct"],
-                    "direction": pred["direction"],
-                    "weight": MODEL_WEIGHTS.get(name, 0.33),
+                    "predicted_price": round(current * math.exp(p["return"]), 4),
+                    "change_pct": round((math.exp(p["return"]) - 1) * 100, 4),
+                    "direction": "BULLISH" if p["return"] > 0 else "BEARISH",
+                    "weight": round(p["weight"] / total_w, 3),
+                    "holdout_metrics": p["metrics"],
                 }
-                for name, pred in model_preds.items()
+                for name, p in preds.items()
             },
-            "ensemble_method": "weighted_average",
-            "models_used": list(model_preds.keys()),
-            "disclaimer": (
-                "⚠️ AI predictions are for educational analysis only. "
-                "Stock markets are inherently unpredictable. "
-                "Do NOT base financial decisions solely on these outputs."
-            ),
+            "ensemble_method": "skill_weighted_returns",
+            "models_used": list(preds),
+            "disclaimer": DISCLAIMER,
         }
 
 
-# Singleton
-ensemble_predictor = EnsemblePredictor()
+class PredictorRegistry:
+    """Per-symbol predictors with a small LRU cache."""
+
+    def __init__(self, max_symbols: int = 50):
+        self.max_symbols = max_symbols
+        self._items: "OrderedDict[str, EnsemblePredictor]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, symbol: str) -> EnsemblePredictor:
+        symbol = symbol.upper()
+        with self._lock:
+            if symbol in self._items:
+                self._items.move_to_end(symbol)
+                return self._items[symbol]
+            predictor = EnsemblePredictor(symbol)
+            self._items[symbol] = predictor
+            if len(self._items) > self.max_symbols:
+                self._items.popitem(last=False)
+            return predictor
+
+    def reload(self, symbol: str) -> Optional[EnsemblePredictor]:
+        with self._lock:
+            self._items.pop(symbol.upper(), None)
+        return self.get(symbol)
+
+
+registry = PredictorRegistry()

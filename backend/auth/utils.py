@@ -1,44 +1,49 @@
-"""JWT authentication utilities."""
-from datetime import datetime, timedelta
+"""JWT and password utilities (PyJWT + bcrypt; python-jose and passlib are unmaintained)."""
+from datetime import timedelta
 from typing import Optional
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from backend.config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt
+import jwt
+
+from backend.config import settings
+from backend.database.session import utcnow
+
+# bcrypt only uses the first 72 bytes of a password.
+_BCRYPT_MAX_BYTES = 72
+
+
+def _encode_pw(password: str) -> bytes:
+    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return bcrypt.checkpw(_encode_pw(plain_password), hashed_password.encode("utf-8"))
+    except ValueError:
+        return False
 
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(_encode_pw(password), bcrypt.gensalt()).decode("utf-8")
+
+
+def _encode(data: dict, token_type: str, expires: timedelta) -> str:
+    payload = data.copy()
+    now = utcnow()
+    payload.update({"exp": now + expires, "iat": now, "type": token_type})
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (
-        expires_delta or timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-    to_encode.update({"exp": expire, "type": "access"})
-    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    return _encode(data, "access", expires_delta or timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES))
 
 
 def create_refresh_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
-    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    return _encode(data, "refresh", timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS))
 
 
 def decode_token(token: str) -> Optional[dict]:
     try:
-        payload = jwt.decode(
-            token,
-            settings.JWT_SECRET_KEY,
-            algorithms=[settings.JWT_ALGORITHM]
-        )
-        return payload
-    except JWTError:
+        return jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    except jwt.PyJWTError:
         return None

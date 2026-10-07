@@ -1,78 +1,96 @@
 """
-ML Service FastAPI Server — standalone microservice for stock predictions and sentiment.
-Consulted by the backend predictions and signals services.
-"""
-import os
-import logging
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+ML Service — internal microservice for return forecasts and news sentiment.
+Consumed by the backend; not meant to be exposed publicly (no CORS).
 
-from ml.ensemble.predictor import ensemble_predictor
+Endpoints are plain `def` so FastAPI runs the CPU/IO-bound model work in its
+threadpool instead of blocking the event loop.
+"""
+import hmac
+import logging
+import os
+import re
+
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+
+from ml.ensemble.predictor import registry
 from ml.sentiment.analyzer import sentiment_analyzer
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
+API_KEY = os.environ.get("ML_SERVICE_API_KEY", "")
+_SYMBOL_RE = re.compile(r"^[A-Z0-9^.\-=]{1,20}$")
+
 app = FastAPI(
-    title="AI Trading — ML Prediction Service",
-    description="Standalone ML microservice: LSTM + XGBoost + ARIMA ensemble + FinBERT sentiment",
-    version="1.0.0",
-    docs_url="/docs",
+    title="AI Trading — ML Service",
+    description="Skill-weighted LSTM + XGBoost + ARIMA return forecasts and FinBERT news sentiment.",
+    version="2.0.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+
+def _symbol(symbol: str) -> str:
+    s = symbol.strip().upper()
+    if not _SYMBOL_RE.match(s):
+        raise HTTPException(status_code=422, detail="Invalid symbol")
+    return s
+
+
+def _require_key(x_api_key: str) -> None:
+    if not API_KEY:
+        raise HTTPException(status_code=403, detail="Training is disabled: set ML_SERVICE_API_KEY")
+    if not hmac.compare_digest(x_api_key or "", API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "ml_prediction_service"}
+    return {"status": "healthy", "service": "ml_service"}
 
 
 @app.get("/predict/{symbol}")
-async def predict(symbol: str, train: bool = False):
-    """
-    Generate ensemble stock price prediction.
-    - Set ?train=true to retrain models (slow, requires TF + XGBoost installed)
-    - Default: loads pre-trained models or falls back to ARIMA-only
-    """
+def predict(symbol: str):
+    """Ensemble next-day / next-week forecast. Uses trained models when present, ARIMA otherwise."""
+    sym = _symbol(symbol)
     try:
-        if train:
-            ensemble_predictor.train_all(symbol.upper())
-        return ensemble_predictor.predict(symbol.upper())
-    except Exception as e:
-        logger.error(f"Prediction failed for {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+        return registry.get(sym).predict()
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception:
+        logger.exception("Prediction failed for %s", sym)
+        raise HTTPException(status_code=500, detail="Prediction failed")
 
 
 @app.get("/sentiment/{symbol}")
-async def get_sentiment(symbol: str):
-    """Run FinBERT sentiment analysis on recent financial news for a symbol."""
+def get_sentiment(symbol: str):
+    sym = _symbol(symbol)
     try:
-        return await sentiment_analyzer.fetch_and_analyze(symbol.upper())
-    except Exception as e:
-        logger.error(f"Sentiment analysis failed for {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=f"Sentiment analysis failed: {e}")
+        return sentiment_analyzer.fetch_and_analyze(sym)
+    except Exception:
+        logger.exception("Sentiment analysis failed for %s", sym)
+        raise HTTPException(status_code=500, detail="Sentiment analysis failed")
 
 
-@app.get("/train/{symbol}")
-async def train_model(symbol: str):
-    """
-    Trigger model training for a symbol.
-    This is a long-running operation. In production, submit to a task queue.
-    """
+def _train(sym: str, period: str) -> None:
     try:
-        ensemble_predictor.train_all(symbol.upper())
-        return {"message": f"Models trained successfully for {symbol.upper()}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Training failed: {e}")
+        report = registry.get(sym).train_all(period)
+        registry.reload(sym)
+        logger.info("Training finished for %s: %s", sym, report)
+    except Exception:
+        logger.exception("Training failed for %s", sym)
+
+
+@app.post("/train/{symbol}", status_code=202)
+def train_model(symbol: str, background: BackgroundTasks, period: str = "5y", x_api_key: str = Header(default="")):
+    """Start (re)training for a symbol in the background. Requires the X-API-Key header."""
+    _require_key(x_api_key)
+    sym = _symbol(symbol)
+    if period not in ("2y", "5y", "10y", "max"):
+        raise HTTPException(status_code=422, detail="period must be one of 2y, 5y, 10y, max")
+    background.add_task(_train, sym, period)
+    return {"message": f"Training started for {sym}", "period": period}
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("ML_SERVICE_PORT", 8001))
-    uvicorn.run("ml.api.server:app", host="0.0.0.0", port=port, reload=False)
+
+    uvicorn.run("ml.api.server:app", host="0.0.0.0", port=int(os.environ.get("ML_SERVICE_PORT", 8001)))

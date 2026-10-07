@@ -1,30 +1,27 @@
 """Database session and engine configuration."""
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from datetime import datetime, timezone
+from typing import AsyncIterator
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
+
 from backend.config import settings
 
-# Engine configuration (handling SQLite specific pooling)
-engine_kwargs = {
-    "echo": settings.APP_ENV == "development",
-}
+engine_kwargs: dict = {"echo": False}
+if "sqlite" in settings.DATABASE_URL:
+    # SQLite connections are cheap; not pooling them avoids sharing aiosqlite
+    # connections across event loops (tests, the runner, alembic).
+    engine_kwargs.update({"poolclass": NullPool, "connect_args": {"timeout": 30}})
+else:
+    engine_kwargs.update({"pool_size": 10, "max_overflow": 20, "pool_pre_ping": True})
 
-if "sqlite" not in settings.DATABASE_URL:
-    engine_kwargs.update({
-        "pool_size": 10,
-        "max_overflow": 20,
-        "pool_pre_ping": True,
-    })
-
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    **engine_kwargs
-)
+engine = create_async_engine(settings.DATABASE_URL, **engine_kwargs)
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
     class_=AsyncSession,
     expire_on_commit=False,
-    autocommit=False,
     autoflush=False,
 )
 
@@ -33,8 +30,18 @@ class Base(DeclarativeBase):
     pass
 
 
-async def get_db() -> AsyncSession:
-    """Dependency: yields a database session."""
+def utcnow() -> datetime:
+    """Timezone-aware UTC timestamp (datetime.utcnow() is deprecated)."""
+    return datetime.now(timezone.utc)
+
+
+def as_utc(dt: datetime) -> datetime:
+    """Normalise DB datetimes (SQLite returns naive values) to aware UTC."""
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+async def get_db() -> AsyncIterator[AsyncSession]:
+    """FastAPI dependency: yields a session, commits on success, rolls back on error."""
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -42,5 +49,3 @@ async def get_db() -> AsyncSession:
         except Exception:
             await session.rollback()
             raise
-        finally:
-            await session.close()

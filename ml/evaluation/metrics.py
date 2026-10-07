@@ -1,43 +1,31 @@
 """
-Model Evaluation Metrics.
-Computes MAE, RMSE, MAPE, and Directional Accuracy for prediction assessment.
+Model evaluation metrics for next-day return forecasts.
 """
+from typing import Dict, Sequence
+
 import numpy as np
-from typing import List, Dict
 
 
-def compute_metrics(y_true: List[float], y_pred: List[float]) -> Dict[str, float]:
+def compute_metrics(y_true: Sequence[float], y_pred: Sequence[float]) -> Dict[str, float]:
     """
-    Compute standard regression and directional metrics.
-
-    Args:
-        y_true: Actual prices
-        y_pred: Predicted prices
-
-    Returns:
-        Dict with MAE, RMSE, MAPE, Directional Accuracy
+    y_true / y_pred are next-day *returns*. Directional accuracy is the share
+    of days where the predicted sign matches the realised sign (days with a
+    zero prediction or zero return are excluded). A model with no skill scores
+    ~50%; anything far above that on out-of-sample data deserves suspicion.
     """
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-
-    mae = float(np.mean(np.abs(y_true - y_pred)))
-    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-
-    # MAPE — avoid division by zero
-    non_zero = y_true != 0
-    mape = float(np.mean(np.abs((y_true[non_zero] - y_pred[non_zero]) / y_true[non_zero])) * 100)
-
-    # Directional accuracy — did the model predict up/down correctly?
-    if len(y_true) > 1:
-        actual_dirs = np.diff(y_true) > 0
-        pred_dirs = np.diff(y_pred) > 0
-        dir_acc = float(np.mean(actual_dirs == pred_dirs) * 100)
-    else:
-        dir_acc = 0.0
-
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    err = y_true - y_pred
+    mae = float(np.mean(np.abs(err))) if len(err) else 0.0
+    rmse = float(np.sqrt(np.mean(err ** 2))) if len(err) else 0.0
+    # Skill vs. the naive "tomorrow's return is zero" forecast.
+    naive_rmse = float(np.sqrt(np.mean(y_true ** 2))) if len(y_true) else 0.0
+    mask = (y_true != 0) & (y_pred != 0)
+    dir_acc = float(np.mean(np.sign(y_true[mask]) == np.sign(y_pred[mask])) * 100) if mask.any() else 0.0
     return {
-        "mae": round(mae, 4),
-        "rmse": round(rmse, 4),
-        "mape_pct": round(mape, 4),
+        "mae": round(mae, 6),
+        "rmse": round(rmse, 6),
+        "rmse_vs_naive": round(rmse / naive_rmse, 4) if naive_rmse else 0.0,
         "directional_accuracy_pct": round(dir_acc, 2),
+        "n": int(len(y_true)),
     }

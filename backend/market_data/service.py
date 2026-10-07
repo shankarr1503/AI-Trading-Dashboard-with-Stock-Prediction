@@ -1,197 +1,228 @@
 """
-Market Data Service — fetches OHLCV and live quotes from multiple sources.
-Primary: yfinance (Yahoo Finance)
-Secondary: Alpha Vantage, Finnhub
-Caching: Redis with TTL
+Market Data Service — live quotes and OHLCV history.
+
+Primary source: yfinance. yfinance is a blocking library, so every call runs in
+a worker thread (asyncio.to_thread) to keep the event loop — and the WebSocket
+streams on it — responsive. Results are cached (Redis or in-process).
 """
-import json
+import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+import math
+import re
+from typing import Any, Dict, List
 
-import yfinance as yf
-import pandas as pd
 import httpx
-import redis.asyncio as aioredis
+import pandas as pd
+import yfinance as yf
 
+from backend.cache import cache_get, cache_set
 from backend.config import settings
+from backend.database.session import utcnow
 
 logger = logging.getLogger(__name__)
 
-# Redis client (using a mock if Redis is unavailable)
-try:
-    redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-except Exception as e:
-    logger.warning(f"Could not initialize Redis client: {e}")
-    redis_client = None
+CACHE_TTL = {"quote": 15, "history": 300, "history_intraday": 60, "search": 3600, "movers": 60}
+VALID_PERIODS = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}
+VALID_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo"}
+_SYMBOL_RE = re.compile(r"^[A-Z0-9^.\-=]{1,20}$")
 
-CACHE_TTL = {
-    "quote": 15,       # 15 seconds for live quotes
-    "history": 300,    # 5 minutes for historical data
-    "search": 3600,    # 1 hour for search results
-    "info": 3600,      # 1 hour for company info
-}
+# Limit concurrent yfinance calls so a burst of requests can't exhaust threads
+# or trip Yahoo's rate limiting.
+_YF_SEMAPHORE = asyncio.Semaphore(8)
+
+
+def validate_symbol(symbol: str) -> str:
+    sym = symbol.strip().upper()
+    if not _SYMBOL_RE.match(sym):
+        raise ValueError(f"Invalid symbol '{symbol}'")
+    return sym
+
+
+def _num(value: Any, default: float = 0.0) -> float:
+    try:
+        f = float(value)
+        return default if math.isnan(f) or math.isinf(f) else f
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_quote_sync(symbol: str) -> Dict[str, Any]:
+    ticker = yf.Ticker(symbol)
+    fast = ticker.fast_info
+    try:
+        info = ticker.info or {}
+    except Exception:  # .info is slow and flaky; fast_info has the essentials
+        info = {}
+
+    def fast_get(key: str):
+        try:
+            return fast.get(key) if hasattr(fast, "get") else getattr(fast, key, None)
+        except Exception:
+            return None
+
+    price = _num(fast_get("lastPrice") or info.get("currentPrice") or info.get("regularMarketPrice"))
+    prev = _num(fast_get("previousClose") or info.get("previousClose"))
+    if price <= 0:
+        raise ValueError(f"No price available for '{symbol}'")
+    quote = {
+        "symbol": symbol,
+        "name": info.get("longName") or info.get("shortName") or symbol,
+        "exchange": info.get("exchange", ""),
+        "currency": info.get("currency") or fast_get("currency") or "USD",
+        "current_price": round(price, 4),
+        "previous_close": round(prev, 4),
+        "open": _num(fast_get("open") or info.get("open")),
+        "day_high": _num(fast_get("dayHigh") or info.get("dayHigh")),
+        "day_low": _num(fast_get("dayLow") or info.get("dayLow")),
+        "volume": int(_num(fast_get("lastVolume") or info.get("volume"))),
+        "avg_volume": int(_num(info.get("averageVolume"))),
+        "market_cap": _num(fast_get("marketCap") or info.get("marketCap")),
+        "pe_ratio": info.get("trailingPE"),
+        "eps": info.get("trailingEps"),
+        "52_week_high": _num(fast_get("yearHigh") or info.get("fiftyTwoWeekHigh")) or None,
+        "52_week_low": _num(fast_get("yearLow") or info.get("fiftyTwoWeekLow")) or None,
+        "sector": info.get("sector", ""),
+        "industry": info.get("industry", ""),
+        "bid": _num(info.get("bid")),
+        "ask": _num(info.get("ask")),
+        "bid_size": int(_num(info.get("bidSize"))),
+        "ask_size": int(_num(info.get("askSize"))),
+        "timestamp": utcnow().isoformat(),
+    }
+    if prev > 0:
+        quote["change"] = round(price - prev, 4)
+        quote["change_pct"] = round((price - prev) / prev * 100, 4)
+    else:
+        quote["change"] = 0.0
+        quote["change_pct"] = 0.0
+    return quote
+
+
+def _fetch_history_sync(symbol: str, period: str, interval: str) -> List[Dict[str, Any]]:
+    df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+    if df is None or df.empty:
+        raise ValueError(f"No historical data found for '{symbol}'")
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df.index = pd.to_datetime(df.index)
+    return [
+        {
+            "timestamp": ts.isoformat(),
+            "open": round(float(row["Open"]), 4),
+            "high": round(float(row["High"]), 4),
+            "low": round(float(row["Low"]), 4),
+            "close": round(float(row["Close"]), 4),
+            "volume": int(_num(row.get("Volume", 0))),
+        }
+        for ts, row in df.iterrows()
+    ]
+
+
+def _fetch_news_sync(symbol: str) -> List[str]:
+    items = yf.Ticker(symbol).news or []
+    headlines = []
+    for item in items[:20]:
+        # yfinance has changed this payload shape across versions.
+        content = item.get("content") if isinstance(item.get("content"), dict) else item
+        title = content.get("title") or ""
+        summary = content.get("summary") or content.get("description") or ""
+        if title:
+            headlines.append(f"{title}. {summary}".strip())
+    return headlines
 
 
 class MarketDataService:
-    """Unified market data service with multi-source fallback and Redis caching."""
-
-    # ─── Cache helpers ────────────────────────────────────────────────────────
-
-    async def _get_cache(self, key: str) -> Optional[Any]:
-        if not redis_client:
-            return None
-        try:
-            data = await redis_client.get(key)
-            return json.loads(data) if data else None
-        except Exception as e:
-            logger.warning(f"Redis GET failed: {e}")
-            return None
-
-    async def _set_cache(self, key: str, value: Any, ttl: int):
-        if not redis_client:
-            return
-        try:
-            await redis_client.setex(key, ttl, json.dumps(value, default=str))
-        except Exception as e:
-            logger.warning(f"Redis SET failed: {e}")
-
-    # ─── Live Quote ───────────────────────────────────────────────────────────
+    """Unified market data access with caching and non-blocking I/O."""
 
     async def get_quote(self, symbol: str) -> Dict[str, Any]:
-        """Get real-time quote for a symbol. Cached for 15 seconds."""
-        cache_key = f"quote:{symbol.upper()}"
-        cached = await self._get_cache(cache_key)
-        if cached:
+        symbol = validate_symbol(symbol)
+        key = f"quote:{symbol}"
+        cached = await cache_get(key)
+        if cached is not None:
             return cached
-
         try:
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            fast_info = ticker.fast_info
-
-            quote = {
-                "symbol": symbol.upper(),
-                "name": info.get("longName", symbol),
-                "exchange": info.get("exchange", ""),
-                "currency": info.get("currency", "USD"),
-                "current_price": fast_info.get("lastPrice") or info.get("currentPrice", 0),
-                "previous_close": fast_info.get("previousClose") or info.get("previousClose", 0),
-                "open": fast_info.get("open") or info.get("open", 0),
-                "day_high": fast_info.get("dayHigh") or info.get("dayHigh", 0),
-                "day_low": fast_info.get("dayLow") or info.get("dayLow", 0),
-                "volume": fast_info.get("lastVolume") or info.get("volume", 0),
-                "avg_volume": info.get("averageVolume", 0),
-                "market_cap": info.get("marketCap", 0),
-                "pe_ratio": info.get("trailingPE"),
-                "eps": info.get("trailingEps"),
-                "52_week_high": fast_info.get("yearHigh") or info.get("fiftyTwoWeekHigh"),
-                "52_week_low": fast_info.get("yearLow") or info.get("fiftyTwoWeekLow"),
-                "sector": info.get("sector", ""),
-                "industry": info.get("industry", ""),
-                "bid": info.get("bid", 0),
-                "ask": info.get("ask", 0),
-                "bid_size": info.get("bidSize", 0),
-                "ask_size": info.get("askSize", 0),
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-
-            # Compute change values
-            if quote["previous_close"] and quote["current_price"]:
-                quote["change"] = round(quote["current_price"] - quote["previous_close"], 4)
-                quote["change_pct"] = round(
-                    (quote["change"] / quote["previous_close"]) * 100, 4
-                )
-            else:
-                quote["change"] = 0
-                quote["change_pct"] = 0
-
-            await self._set_cache(cache_key, quote, CACHE_TTL["quote"])
-            return quote
-
+            async with _YF_SEMAPHORE:
+                quote = await asyncio.to_thread(_fetch_quote_sync, symbol)
+        except ValueError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to fetch quote for {symbol}: {e}")
-            raise ValueError(f"Could not fetch quote for symbol '{symbol}': {e}")
+            logger.warning("Quote fetch failed for %s: %s", symbol, e)
+            raise ValueError(f"Could not fetch quote for '{symbol}'") from e
+        await cache_set(key, quote, CACHE_TTL["quote"])
+        return quote
 
-    # ─── Historical OHLCV ─────────────────────────────────────────────────────
-
-    async def get_history(
-        self,
-        symbol: str,
-        period: str = "1y",
-        interval: str = "1d",
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch historical OHLCV data.
-        period: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max
-        interval: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo
-        """
-        cache_key = f"history:{symbol.upper()}:{period}:{interval}"
-        cached = await self._get_cache(cache_key)
-        if cached:
+    async def get_history(self, symbol: str, period: str = "1y", interval: str = "1d") -> List[Dict[str, Any]]:
+        symbol = validate_symbol(symbol)
+        if period not in VALID_PERIODS:
+            raise ValueError(f"Invalid period '{period}'")
+        if interval not in VALID_INTERVALS:
+            raise ValueError(f"Invalid interval '{interval}'")
+        key = f"history:{symbol}:{period}:{interval}"
+        cached = await cache_get(key)
+        if cached is not None:
             return cached
-
         try:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period, interval=interval, auto_adjust=True)
-
-            if df.empty:
-                raise ValueError(f"No historical data found for '{symbol}'")
-
-            df.index = pd.to_datetime(df.index)
-            records = []
-            for ts, row in df.iterrows():
-                records.append({
-                    "timestamp": ts.isoformat(),
-                    "open": round(float(row.get("Open", 0)), 4),
-                    "high": round(float(row.get("High", 0)), 4),
-                    "low": round(float(row.get("Low", 0)), 4),
-                    "close": round(float(row.get("Close", 0)), 4),
-                    "volume": int(row.get("Volume", 0)),
-                })
-
-            ttl = 60 if interval in ("1m", "2m", "5m") else CACHE_TTL["history"]
-            await self._set_cache(cache_key, records, ttl)
-            return records
-
+            async with _YF_SEMAPHORE:
+                records = await asyncio.to_thread(_fetch_history_sync, symbol, period, interval)
+        except ValueError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to fetch history for {symbol}: {e}")
-            raise ValueError(f"Could not fetch history for '{symbol}': {e}")
+            logger.warning("History fetch failed for %s: %s", symbol, e)
+            raise ValueError(f"Could not fetch history for '{symbol}'") from e
+        intraday = interval in ("1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h")
+        await cache_set(key, records, CACHE_TTL["history_intraday" if intraday else "history"])
+        return records
 
-    # ─── Symbol Search ────────────────────────────────────────────────────────
+    async def get_history_df(self, symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+        """History as a DataFrame indexed by timestamp with lower-case OHLCV columns."""
+        records = await self.get_history(symbol, period, interval)
+        df = pd.DataFrame(records)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        return df.set_index("timestamp").astype(float)
+
+    async def get_news(self, symbol: str) -> List[str]:
+        symbol = validate_symbol(symbol)
+        key = f"news:{symbol}"
+        cached = await cache_get(key)
+        if cached is not None:
+            return cached
+        try:
+            async with _YF_SEMAPHORE:
+                headlines = await asyncio.to_thread(_fetch_news_sync, symbol)
+        except Exception as e:
+            logger.info("News fetch failed for %s: %s", symbol, e)
+            headlines = []
+        await cache_set(key, headlines, 900)
+        return headlines
 
     async def search_symbols(self, query: str) -> List[Dict[str, str]]:
-        """Search for stock symbols by name or ticker."""
-        cache_key = f"search:{query.lower()}"
-        cached = await self._get_cache(cache_key)
-        if cached:
+        query = query.strip()[:50]
+        key = f"search:{query.lower()}"
+        cached = await cache_get(key)
+        if cached is not None:
             return cached
 
-        # Use Finnhub if key available, else basic yfinance search
         if settings.FINNHUB_API_KEY:
             try:
-                async with httpx.AsyncClient() as client:
+                async with httpx.AsyncClient(timeout=10) as client:
                     resp = await client.get(
                         f"{settings.FINNHUB_BASE_URL}/search",
                         params={"q": query, "token": settings.FINNHUB_API_KEY},
-                        timeout=10,
                     )
-                    data = resp.json()
+                    resp.raise_for_status()
                     results = [
                         {
                             "symbol": item["symbol"],
-                            "name": item["description"],
+                            "name": item.get("description", ""),
                             "type": item.get("type", ""),
                             "exchange": item.get("primaryExchange", ""),
                         }
-                        for item in data.get("result", [])[:15]
+                        for item in resp.json().get("result", [])[:15]
                     ]
-                    await self._set_cache(cache_key, results, CACHE_TTL["search"])
+                    await cache_set(key, results, CACHE_TTL["search"])
                     return results
             except Exception as e:
-                logger.warning(f"Finnhub search failed: {e}")
+                logger.warning("Finnhub search failed: %s", e)
 
-        # Fallback: predefined popular stocks matching query
         popular = [
             {"symbol": "AAPL", "name": "Apple Inc.", "type": "stock", "exchange": "NASDAQ"},
             {"symbol": "MSFT", "name": "Microsoft Corporation", "type": "stock", "exchange": "NASDAQ"},
@@ -200,6 +231,7 @@ class MarketDataService:
             {"symbol": "TSLA", "name": "Tesla Inc.", "type": "stock", "exchange": "NASDAQ"},
             {"symbol": "NVDA", "name": "NVIDIA Corporation", "type": "stock", "exchange": "NASDAQ"},
             {"symbol": "META", "name": "Meta Platforms Inc.", "type": "stock", "exchange": "NASDAQ"},
+            {"symbol": "JPM", "name": "JPMorgan Chase & Co.", "type": "stock", "exchange": "NYSE"},
             {"symbol": "RELIANCE.NS", "name": "Reliance Industries", "type": "stock", "exchange": "NSE"},
             {"symbol": "TCS.NS", "name": "Tata Consultancy Services", "type": "stock", "exchange": "NSE"},
             {"symbol": "INFY.NS", "name": "Infosys Ltd", "type": "stock", "exchange": "NSE"},
@@ -207,42 +239,36 @@ class MarketDataService:
             {"symbol": "WIPRO.NS", "name": "Wipro Ltd", "type": "stock", "exchange": "NSE"},
         ]
         q = query.upper()
-        results = [
-            s for s in popular
-            if q in s["symbol"].upper() or q in s["name"].upper()
-        ][:10]
-        await self._set_cache(cache_key, results, CACHE_TTL["search"])
+        results = [s for s in popular if q in s["symbol"] or q in s["name"].upper()][:10]
+        await cache_set(key, results, CACHE_TTL["search"])
         return results
 
-    # ─── Market Movers ────────────────────────────────────────────────────────
+    async def get_quotes(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Fetch several quotes concurrently; failures map to {'error': ...}."""
+        async def one(sym: str):
+            try:
+                return sym, await self.get_quote(sym)
+            except ValueError as e:
+                return sym, {"error": str(e)}
+
+        return dict(await asyncio.gather(*(one(s) for s in symbols)))
 
     async def get_market_movers(self) -> Dict[str, List[Dict]]:
-        """Get top gainers, losers, and most active stocks."""
-        cache_key = "market:movers"
-        cached = await self._get_cache(cache_key)
-        if cached:
+        key = "market:movers"
+        cached = await cache_get(key)
+        if cached is not None:
             return cached
-
-        # Well-known liquid symbols for demo movers
-        symbols = [
-            "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META",
-            "JPM", "BAC", "GS", "V", "MA", "JNJ", "PFE", "WMT",
-        ]
-        quotes = []
-        for sym in symbols:
-            try:
-                q = await self.get_quote(sym)
-                quotes.append(q)
-            except Exception:
-                continue
-
-        sorted_by_change = sorted(quotes, key=lambda x: x.get("change_pct", 0))
+        symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META",
+                   "JPM", "BAC", "GS", "V", "MA", "JNJ", "PFE", "WMT"]
+        quotes = [q for q in (await self.get_quotes(symbols)).values() if "error" not in q]
+        by_change = sorted(quotes, key=lambda x: x.get("change_pct", 0))
         movers = {
-            "gainers": [q for q in sorted_by_change if q.get("change_pct", 0) > 0][-5:][::-1],
-            "losers": sorted_by_change[:5],
+            "gainers": [q for q in reversed(by_change) if q.get("change_pct", 0) > 0][:5],
+            "losers": [q for q in by_change if q.get("change_pct", 0) < 0][:5],
             "most_active": sorted(quotes, key=lambda x: x.get("volume", 0), reverse=True)[:5],
         }
-        await self._set_cache(cache_key, movers, 60)
+        if quotes:
+            await cache_set(key, movers, CACHE_TTL["movers"])
         return movers
 
 

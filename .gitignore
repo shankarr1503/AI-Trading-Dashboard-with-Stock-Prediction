@@ -56,3 +56,8 @@ coverage.xml
 # ─── OS ──────────────────────────────────────────────────────
 Thumbs.db
 .DS_Store
+
+# Local dev artefacts
+trading.db
+*.tsbuildinfo
+frontend/next-env.d.ts

@@ -1,25 +1,20 @@
 """Authentication schemas (Pydantic models)."""
 from typing import Optional
-from pydantic import BaseModel, EmailStr, field_validator
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class UserCreate(BaseModel):
     email: EmailStr
-    username: str
-    password: str
-    full_name: Optional[str] = None
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=8, max_length=128)
+    full_name: Optional[str] = Field(default=None, max_length=255)
 
     @field_validator("username")
     @classmethod
-    def username_alphanumeric(cls, v):
-        assert v.isalnum(), "Username must be alphanumeric"
-        assert len(v) >= 3, "Username must be at least 3 characters"
-        return v
-
-    @field_validator("password")
-    @classmethod
-    def password_strength(cls, v):
-        assert len(v) >= 8, "Password must be at least 8 characters"
+    def username_alphanumeric(cls, v: str) -> str:
+        if not v.isalnum():
+            raise ValueError("Username must be alphanumeric")
         return v
 
 
@@ -29,14 +24,14 @@ class UserLogin(BaseModel):
 
 
 class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     email: str
     username: str
     full_name: Optional[str]
     is_active: bool
-
-    class Config:
-        from_attributes = True
+    is_superuser: bool
 
 
 class Token(BaseModel):
@@ -44,11 +39,6 @@ class Token(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     expires_in: int
-
-
-class TokenData(BaseModel):
-    user_id: Optional[int] = None
-    email: Optional[str] = None
 
 
 class RefreshTokenRequest(BaseModel):

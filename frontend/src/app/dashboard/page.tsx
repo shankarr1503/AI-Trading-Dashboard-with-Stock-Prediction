@@ -8,6 +8,7 @@ import MarketMovers from '@/components/market/MarketMovers';
 import PredictionPanel from '@/components/prediction/PredictionPanel';
 import PortfolioSummary from '@/components/portfolio/PortfolioSummary';
 import SentimentGauge from '@/components/sentiment/SentimentGauge';
+import TickerBar from '@/components/market/TickerBar';
 
 const TAB_ITEMS = ['Chart', 'Indicators', 'Portfolio', 'Sentiment'] as const;
 type Tab = typeof TAB_ITEMS[number];
@@ -21,23 +22,7 @@ export default function DashboardPage() {
       {/* Header */}
       <Header onSymbolSelect={setActiveSymbol} activeSymbol={activeSymbol} />
 
-      {/* Ticker Bar */}
-      <div className="ticker-bar py-2 px-4 text-xs font-mono" style={{ background: '#0d1117' }}>
-        <div className="ticker-content">
-          {['AAPL +1.24%', 'MSFT +0.85%', 'GOOGL -0.32%', 'TSLA +3.21%', 'NVDA +4.52%',
-            'AMZN +1.23%', 'META +2.87%', 'RELIANCE.NS +0.66%', 'TCS.NS +1.12%',
-            'AAPL +1.24%', 'MSFT +0.85%', 'GOOGL -0.32%', 'TSLA +3.21%', 'NVDA +4.52%',
-            'AMZN +1.23%', 'META +2.87%', 'RELIANCE.NS +0.66%', 'TCS.NS +1.12%',
-          ].map((tick, i) => {
-            const isPos = tick.includes('+');
-            return (
-              <span key={i} style={{ color: isPos ? '#00d4aa' : '#ff4757', marginRight: 32 }}>
-                {tick}
-              </span>
-            );
-          })}
-        </div>
-      </div>
+      <TickerBar />
 
       {/* Main Layout */}
       <div className="flex h-[calc(100vh-90px)] overflow-hidden">

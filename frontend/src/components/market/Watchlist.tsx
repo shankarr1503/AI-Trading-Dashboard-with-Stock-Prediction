@@ -25,7 +25,10 @@ export default function Watchlist({ onSymbolSelect, activeSymbol }: WatchlistPro
   const fetchQuotes = async () => {
     try {
       const res = await marketApi.getBatch(DEFAULT_WATCHLIST);
-      const data = res.data;
+      // Symbols that failed to load come back as {error: ...}; skip them.
+      const data = Object.fromEntries(
+        Object.entries(res.data as Record<string, any>).filter(([, q]) => q && !q.error),
+      ) as Record<string, Stock>;
       setStocks(prev => ({ ...prev, ...data }));
     } catch (e) {
       console.error('Watchlist fetch failed:', e);
@@ -72,7 +75,7 @@ export default function Watchlist({ onSymbolSelect, activeSymbol }: WatchlistPro
         ) : (
           DEFAULT_WATCHLIST.map((symbol) => {
             const stock = stocks[symbol];
-            if (!stock || stock.error) return null;
+            if (!stock) return null;
 
             const isPositive = (stock.change_pct || 0) >= 0;
             const isActive = symbol === activeSymbol;

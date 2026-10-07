@@ -1,239 +1,156 @@
-# 🚀 AI-Powered Trading Analytics Platform
+# AI Trading Dashboard & Agentic Trading Bot
 
-> A production-grade, full-scale trading analytics platform with real-time market data, interactive charts, technical indicators, AI-based stock predictions, portfolio analytics, and market sentiment analysis.
+Market dashboard (live quotes, charts, indicators, ML forecasts, news sentiment, portfolio analytics) plus an
+**agentic, risk-managed trading bot** that paper-trades by default.
 
-![Platform Banner](docs/banner.png)
+## ⚠️ Read this first
 
-## ⚠️ DISCLAIMER
-
-> **Stock market predictions cannot guarantee accuracy.** Financial markets are influenced by a complex combination of economic, political, psychological, and random factors. This platform is designed for **educational and analytical purposes only**. Do **NOT** make financial decisions based solely on AI predictions from this system.
-
----
-
-## 📋 Features
-
-| Feature | Description |
-|---------|-------------|
-| 📈 **Real-Time Market Data** | Live OHLCV quotes via Yahoo Finance, Alpha Vantage, Polygon |
-| 🕯️ **Interactive Charts** | Candlestick, line, volume overlays with zoom/pan |
-| 📊 **Technical Indicators** | SMA, EMA, RSI, MACD, Bollinger Bands, VWAP, ATR, Stochastic |
-| 🤖 **AI Stock Prediction** | LSTM, XGBoost, ARIMA, Random Forest, Ensemble models |
-| 💬 **Sentiment Analysis** | FinBERT NLP on financial news and social media |
-| 🔔 **Trade Signals** | AI-driven BUY/SELL/HOLD with entry/target/stop-loss |
-| 💼 **Portfolio Analytics** | P&L, Sharpe ratio, drawdown, sector allocation |
-| 🔔 **Smart Alerts** | Price thresholds, signal triggers, volume spikes |
-| 🔐 **Authentication** | JWT-based secure user auth |
-| 🐳 **Containerized** | Docker + Kubernetes + CI/CD ready |
+- **No trading system can guarantee profits or prevent losses.** This bot is engineered to *limit* losses and to
+  *refuse* trades whose expected edge doesn't clear transaction costs, not to promise gains. Losing trades and
+  losing periods will happen.
+- The bot runs in **paper mode** (simulated money) unless you explicitly configure otherwise. Live trading
+  requires `TRADING_MODE=alpaca_live` **and** `ALLOW_LIVE_TRADING=true`.
+- Backtests (including walk-forward) are simulations. Real fills, outages and regime changes will differ. Paper-trade
+  for weeks and review the decision journal before risking real money.
+- Nothing here is financial advice.
 
 ---
 
-## 🏗️ Architecture
+## How the bot decides
+
+Each cycle (default every 15 minutes, `python -m backend.trading.runner`):
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     FRONTEND (Next.js 14)                     │
-│  Dashboard │ Charts │ Predictions │ Portfolio │ Sentiment     │
-└─────────────────────────┬────────────────────────────────────┘
-                          │ REST API + WebSocket
-┌─────────────────────────▼────────────────────────────────────┐
-│                  BACKEND (FastAPI)                             │
-│  Market Data │ Indicators │ Auth │ Portfolio │ Alerts         │
-└──────┬───────────────┬───────────────┬────────────────────────┘
-       │               │               │
-┌──────▼──────┐ ┌──────▼──────┐ ┌─────▼──────┐
-│  ML Service │ │  PostgreSQL  │ │   Redis    │
-│ (LSTM/XGB)  │ │  (Storage)  │ │  (Cache)   │
-└─────────────┘ └─────────────┘ └────────────┘
+observe ──► analyse ──► estimate edge ──► risk manager ──► (Claude review) ──► execute ──► journal
 ```
 
----
+1. **Observe**: account, positions and quotes from the broker. Positions are reconciled with the bot's own
+   stop/target records; positions opened elsewhere are adopted with a protective stop.
+2. **Protect first**: every cycle (even when paused) enforces hard stops, take-profits, trailing stops
+   (breakeven + costs after +1.5 ATR, then a 3-ATR chandelier trail), signal-reversal exits and a 40-day time stop.
+3. **Analyse** (`backend/trading/strategy.py`): six evidence sources scored in [-1, 1] and weighted by the
+   detected **market regime** (bull trend / bear trend / range / high volatility):
+   trend (EMA 20/50/200 + MACD, scaled by ADX), momentum (vol-normalised 3-month and 1-month returns),
+   regime-aware mean reversion, OBV volume flow, the ML ensemble's P(up), and news sentiment.
+4. **Estimate edge** (`calibration.py`): a score is not a probability. Walk-forward backtests learn win rate and
+   average win/loss in R-multiples per score bucket. These estimates are shrunk toward a conservative prior
+   (Beta-binomial), so a few lucky trades can't inflate confidence.
+5. **Risk manager** (`risk.py`), the final authority that nothing can bypass:
+   - risk ≤ 1% of equity per trade (quarter-Kelly, capped), ≤ 15% per position, ≤ 90% gross exposure, no leverage
+   - **cost gate**: expected edge must be ≥ 2× round-trip costs (spread + slippage + commission + fees)
+   - minimum expectancy (0.10R) and reward:risk (1.5)
+   - correlation limit vs. existing positions, max 8 open positions
+   - size halves in high-volatility regimes and shrinks as drawdown grows
+   - **circuit breakers**: −2% day → no new entries; 4 consecutive losses → 24h cooldown;
+     −10% from the high-water mark → **kill switch** (flatten everything and halt until an admin resets it)
+6. **Claude review (optional)**: with `LLM_REVIEW_ENABLED=true`, Claude (`claude-opus-5-5`) investigates each
+   approved trade using read-only tools (price history, headlines, portfolio). It looks for things price signals
+   miss, such as earnings inside the holding period, fraud probes or halts. It can only **approve, shrink or veto**,
+   never enlarge a trade. If the API fails, the default is to veto.
+7. **Execute**: paper broker (fills at the live quote ± spread/slippage/fees), or Alpaca with **bracket orders**,
+   so a broker-side stop protects each position even if the bot process dies.
+8. **Journal**: every evaluation, including trades *not* taken and why, is stored and shown on the `/bot` page.
 
-## 🛠️ Tech Stack
+### Validate before trusting it
 
-### Backend
-- **FastAPI** — High-performance async Python API
-- **WebSockets** — Real-time price streaming
-- **SQLAlchemy + Alembic** — ORM + migrations
-- **PostgreSQL** — Primary database
-- **Redis** — Caching layer
-- **JWT (python-jose)** — Authentication
-
-### Machine Learning
-- **TensorFlow/Keras** — LSTM deep learning
-- **scikit-learn** — Random Forest, preprocessing
-- **XGBoost** — Gradient boosting
-- **statsmodels** — ARIMA time-series
-- **pandas-ta** — Technical indicator computation
-- **transformers (HuggingFace)** — FinBERT sentiment
-
-### Frontend
-- **Next.js 14** — React framework with App Router
-- **Tailwind CSS** — Utility-first styling
-- **TradingView Lightweight Charts** — Professional charting
-- **Recharts** — Portfolio visualizations
-- **Zustand** — Global state management
-- **SWR** — Data fetching with revalidation
-
-### Data Sources
-- Yahoo Finance (`yfinance`)
-- Alpha Vantage API
-- Polygon.io API
-- Finnhub API
-- NSE India API
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-- Docker & Docker Compose
-- Node.js 18+
-- Python 3.11+
-
-### 1. Clone & Configure
 ```bash
-git clone https://github.com/your-org/ai-trading-platform.git
-cd ai-trading-platform
+# Walk-forward, out-of-sample backtest of the exact live logic (needs internet for Yahoo data)
+curl -X POST localhost:8000/api/bot/backtest -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"symbols":["AAPL","MSFT","NVDA","JPM","WMT"],"period":"5y","walk_forward":true}'
+```
+
+Results include costs paid, max drawdown, Sharpe/Sortino, expectancy and an equal-weight buy-and-hold benchmark.
+`POST /api/bot/calibrate` (admin) stores the learned edge statistics that the live bot uses.
+
+Backtest assumptions are conservative: signals execute at the **next bar's open**, every fill pays costs,
+gaps through a stop fill at the worse open price, and if a bar touches both stop and target, the stop is assumed hit.
+
+---
+
+## Architecture
+
+```
+frontend (Next.js) ──► nginx ──► backend (FastAPI) ──► PostgreSQL / Redis
+                                    │    ▲
+                                    │    └── bot runner (same image, one process)
+                                    └──► ml_service (XGBoost + ARIMA [+ LSTM], FinBERT/lexicon sentiment)
+                                    └──► broker: paper simulator | Alpaca
+                                    └──► Claude API (optional reviewer)
+```
+
+| Path | What |
+|---|---|
+| `shared/indicators.py` | Pure pandas/numpy indicators (RSI, MACD, BB, ATR, ADX, Stoch, OBV, VWAP…), causal by construction |
+| `backend/trading/` | `strategy`, `regime`, `calibration`, `risk`, `costs`, `backtest`, `broker`, `llm_reviewer`, `agent`, `runner`, `router` |
+| `backend/` | API: auth (JWT), market data, indicators, predictions, signals, portfolio, alerts |
+| `ml/` | Per-symbol models predicting next-day **returns**, weighted by holdout skill; no train/test leakage |
+| `tests/` | Offline suite on synthetic data: indicators, risk, strategy, backtests, agent cycles, API, ML |
+
+---
+
+## Quick start
+
+### Docker (full stack)
+
+```bash
 cp .env.example .env
-# Edit .env with your API keys
+# set POSTGRES_PASSWORD and JWT_SECRET_KEY (openssl rand -hex 32)
+docker compose up --build
 ```
 
-### 2. Start with Docker Compose
+Open http://localhost. The **first account you register becomes the administrator** (bot controls).
+
+### Local development
+
 ```bash
-docker-compose up --build
-```
-
-Services will start at:
-- **Frontend**: http://localhost:3000
-- **Backend API**: http://localhost:8000
-- **ML Service**: http://localhost:8001
-- **API Docs**: http://localhost:8000/docs
-
-### 3. Local Development
-
-**Backend:**
-```bash
-cd backend
-pip install -r requirements.txt
+python -m venv .venv && . .venv/bin/activate
+pip install -r backend/requirements-dev.txt
+cp .env.example .env                      # SQLite by default, no Postgres needed
 alembic upgrade head
-uvicorn main:app --reload --port 8000
+uvicorn backend.main:app --reload         # API on :8000, docs at /docs
+python -m backend.trading.runner          # the bot (separate terminal)
+
+# optional ML service
+pip install -r ml/requirements.txt
+uvicorn ml.api.server:app --port 8001
+python -m ml.training.train --symbol AAPL,MSFT --period 5y
+
+# frontend
+cd frontend && npm ci && npm run dev      # http://localhost:3000
 ```
 
-**Frontend:**
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-**ML Service:**
-```bash
-cd ml
-pip install -r requirements.txt
-python api/server.py
-```
-
----
-
-## 📁 Project Structure
-
-```
-ai-trading-platform/
-├── backend/                  # FastAPI backend
-│   ├── main.py
-│   ├── config.py
-│   ├── auth/                 # JWT authentication
-│   ├── market_data/          # Real-time market data
-│   ├── indicators/           # Technical indicator engine
-│   ├── predictions/          # ML prediction service
-│   ├── signals/              # AI signal generator
-│   ├── portfolio/            # Portfolio analytics
-│   ├── alerts/               # Alert system
-│   └── database/             # DB models & migrations
-├── frontend/                 # Next.js 14 frontend
-│   ├── src/
-│   │   ├── app/              # App router pages
-│   │   ├── components/       # UI components
-│   │   └── lib/              # Utilities, API, store
-│   └── public/
-├── ml/                       # Machine learning
-│   ├── models/               # LSTM, XGBoost, ARIMA
-│   ├── ensemble/             # Ensemble predictor
-│   ├── sentiment/            # FinBERT NLP
-│   ├── feature_engineering/
-│   ├── training/
-│   ├── evaluation/
-│   └── api/                  # ML FastAPI server
-├── data_pipeline/            # Data ingestion & processing
-├── database/                 # SQL schema & migrations
-├── deployment/               # Docker, K8s, CI/CD
-└── tests/                    # Unit & integration tests
-```
-
----
-
-## 🔑 Environment Variables
-
-See `.env.example` for all required variables. Key ones:
-
-| Variable | Description |
-|----------|-------------|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `REDIS_URL` | Redis connection URL |
-| `JWT_SECRET_KEY` | Secret for JWT signing |
-| `ALPHA_VANTAGE_API_KEY` | Alpha Vantage API key |
-| `POLYGON_API_KEY` | Polygon.io API key |
-| `FINNHUB_API_KEY` | Finnhub API key |
-
----
-
-## 📡 API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/auth/register` | Register new user |
-| POST | `/auth/login` | Login & get JWT |
-| GET | `/api/market/quote/{symbol}` | Live quote |
-| GET | `/api/market/history/{symbol}` | Historical OHLCV |
-| GET | `/api/indicators/{symbol}` | Technical indicators |
-| GET | `/api/predict/{symbol}` | ML price prediction |
-| GET | `/api/signals/{symbol}` | AI trade signal |
-| GET | `/api/portfolio/` | Portfolio summary |
-| WS | `/ws/market/{symbol}` | Real-time price stream |
-
----
-
-## 🧪 Testing
+### Tests
 
 ```bash
-# Backend tests
-cd backend && pytest tests/ -v
-
-# Frontend tests
-cd frontend && npm test
+python -m pytest            # backend, bot, API (offline)
+cd frontend && npm run lint && npm run typecheck && npm run build
 ```
 
 ---
 
-## 🚢 Deployment
+## Bot API (`/api/bot`)
 
-See `deployment/` directory for:
-- **Docker**: `Dockerfile.backend`, `Dockerfile.frontend`, `Dockerfile.ml`
-- **Kubernetes**: `deployment/k8s/`
-- **CI/CD**: `deployment/github-actions/ci-cd.yml`
+| Method | Path | Who | |
+|---|---|---|---|
+| GET | `/status` `/positions` `/trades` `/orders` `/decisions` `/equity` `/performance` | user | State and journal |
+| GET | `/analyze/{symbol}` | user | What the bot thinks now (no order placed) |
+| POST | `/backtest` | user | Backtest / walk-forward |
+| POST | `/start` `/stop` | admin | Enable entries / pause entries (stops stay enforced) |
+| POST | `/run-once` | admin | Run one full cycle now |
+| POST | `/flatten` | admin | Panic button: close everything and pause |
+| POST | `/reset-halt` | admin | Acknowledge a circuit-breaker halt |
+| PUT | `/config` | admin | Adjust risk limits (within hard bounds) and the universe |
+| POST | `/calibrate` | admin | Walk-forward calibrate the live edge estimates |
 
----
+## Configuration
 
-## 📜 License
+See `.env.example`. Key settings: `TRADING_MODE`, `ALLOW_LIVE_TRADING`, `BOT_UNIVERSE`, `BOT_CYCLE_MINUTES`,
+`LLM_REVIEW_ENABLED`, `ANTHROPIC_API_KEY`, `JWT_SECRET_KEY` (required, ≥32 chars, outside development).
 
-MIT License. See [LICENSE](LICENSE) for details.
+## Known limitations
 
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+- Daily-bar strategy; it is not a high-frequency system. Exchange holidays are not modelled (Alpaca's clock is used in Alpaca modes).
+- Long-only. Shorting is intentionally not implemented (unbounded loss).
+- Yahoo Finance data is free but unofficial and can be delayed or rate-limited.
+- Alpaca supports US equities only; NSE symbols work in the dashboard, backtests and the paper broker.

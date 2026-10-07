@@ -1,7 +1,9 @@
 'use client';
 import { useState, useCallback } from 'react';
-import { FiSearch, FiBell, FiUser, FiWifi } from 'react-icons/fi';
+import Link from 'next/link';
+import { FiSearch, FiCpu, FiLogOut, FiUser } from 'react-icons/fi';
 import { marketApi } from '@/lib/api';
+import { useAuth } from '@/lib/useAuth';
 
 interface SearchResult {
   symbol: string;
@@ -18,6 +20,7 @@ export default function Header({ onSymbolSelect, activeSymbol }: HeaderProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [loading, setLoading] = useState(false);
+  const { user, logout } = useAuth();
 
   const search = useCallback(async (q: string) => {
     setQuery(q);
@@ -87,27 +90,29 @@ export default function Header({ onSymbolSelect, activeSymbol }: HeaderProps) {
       </div>
 
       {/* Right Controls */}
-      <div className="flex items-center gap-4">
-        {/* Live indicator */}
-        <div className="flex items-center gap-2 text-xs" style={{ color: '#00d4aa' }}>
-          <div className="w-2 h-2 rounded-full animate-pulse" style={{ background: '#00d4aa' }} />
-          LIVE
-        </div>
-        
+      <div className="flex items-center gap-3">
         <span className="font-mono text-sm font-semibold px-3 py-1.5 rounded-lg"
           style={{ background: '#1a1d24', color: '#4fa3ff', border: '1px solid #1e2535' }}>
           {activeSymbol}
         </span>
 
-        <button className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors hover:bg-white/5"
+        <Link href="/bot" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-white/5"
           style={{ background: '#1a1d24', border: '1px solid #1e2535', color: '#9ba3b8' }}>
-          <FiBell className="w-4 h-4" />
-        </button>
+          <FiCpu className="w-4 h-4" /> Trading Bot
+        </Link>
 
-        <button className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors hover:bg-white/5"
-          style={{ background: '#1a1d24', border: '1px solid #1e2535', color: '#9ba3b8' }}>
-          <FiUser className="w-4 h-4" />
-        </button>
+        {user ? (
+          <button onClick={logout} title="Sign out"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs hover:bg-white/5"
+            style={{ background: '#1a1d24', border: '1px solid #1e2535', color: '#9ba3b8' }}>
+            <FiUser className="w-4 h-4" /> {user.username} <FiLogOut className="w-3.5 h-3.5" />
+          </button>
+        ) : (
+          <Link href="/login" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs hover:bg-white/5"
+            style={{ background: '#1a1d24', border: '1px solid #1e2535', color: '#9ba3b8' }}>
+            <FiUser className="w-4 h-4" /> Sign in
+          </Link>
+        )}
       </div>
     </header>
   );

@@ -1,51 +1,70 @@
 """
 WebSocket server for real-time price streaming.
-Clients subscribe to a symbol and receive live quotes every ~5 seconds.
+
+One background poller runs per subscribed symbol and broadcasts each quote to
+every client watching that symbol, so N viewers cost one upstream fetch, not N.
 """
 import asyncio
 import json
 import logging
 from typing import Dict, Set
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from backend.market_data.service import market_data_service
+from backend.market_data.service import market_data_service, validate_symbol
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+POLL_SECONDS = 5.0
+
 
 class ConnectionManager:
-    """Manages WebSocket connections grouped by stock symbol."""
+    """Tracks subscribers per symbol and owns one polling task per symbol."""
 
     def __init__(self):
-        # symbol -> set of connected websockets
         self.active_connections: Dict[str, Set[WebSocket]] = {}
+        self._pollers: Dict[str, asyncio.Task] = {}
 
     async def connect(self, websocket: WebSocket, symbol: str):
         await websocket.accept()
-        if symbol not in self.active_connections:
-            self.active_connections[symbol] = set()
-        self.active_connections[symbol].add(websocket)
-        logger.info(f"WebSocket connected: {symbol} (total: {len(self.active_connections[symbol])})")
+        self.active_connections.setdefault(symbol, set()).add(websocket)
+        if symbol not in self._pollers or self._pollers[symbol].done():
+            self._pollers[symbol] = asyncio.create_task(self._poll(symbol))
+        logger.info("WebSocket connected: %s (subscribers: %d)", symbol, len(self.active_connections[symbol]))
 
     def disconnect(self, websocket: WebSocket, symbol: str):
-        if symbol in self.active_connections:
-            self.active_connections[symbol].discard(websocket)
-            if not self.active_connections[symbol]:
+        subs = self.active_connections.get(symbol)
+        if subs is not None:
+            subs.discard(websocket)
+            if not subs:
                 del self.active_connections[symbol]
-        logger.info(f"WebSocket disconnected: {symbol}")
+                task = self._pollers.pop(symbol, None)
+                if task:
+                    task.cancel()
 
     async def broadcast(self, symbol: str, message: dict):
-        if symbol not in self.active_connections:
-            return
-        dead_connections = set()
-        for ws in self.active_connections[symbol]:
+        dead = []
+        for ws in list(self.active_connections.get(symbol, ())):
             try:
                 await ws.send_json(message)
             except Exception:
-                dead_connections.add(ws)
-        for ws in dead_connections:
-            self.active_connections[symbol].discard(ws)
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws, symbol)
+
+    async def _poll(self, symbol: str):
+        while symbol in self.active_connections:
+            try:
+                quote = await market_data_service.get_quote(symbol)
+                await self.broadcast(symbol, {"type": "quote", "data": quote})
+            except ValueError as e:
+                await self.broadcast(symbol, {"type": "error", "message": str(e)})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Quote poller failed for %s", symbol)
+            await asyncio.sleep(POLL_SECONDS)
 
 
 manager = ConnectionManager()
@@ -53,38 +72,25 @@ manager = ConnectionManager()
 
 @router.websocket("/market/{symbol}")
 async def websocket_market_stream(websocket: WebSocket, symbol: str):
-    """
-    WebSocket endpoint for real-time price updates.
-    Streams live quote every 5 seconds to all connected clients.
-    """
-    symbol = symbol.upper()
+    """Stream live quotes for `symbol` every ~5 seconds. Send {"type":"ping"} for a pong."""
+    try:
+        symbol = validate_symbol(symbol)
+    except ValueError:
+        await websocket.close(code=1008)
+        return
     await manager.connect(websocket, symbol)
     try:
-        # Send initial quote immediately
-        quote = await market_data_service.get_quote(symbol)
-        await websocket.send_json({"type": "quote", "data": quote})
-
-        # Stream updates every 5 seconds
         while True:
-            # Check for incoming messages (e.g., client pings or unsubscribe)
+            msg = await websocket.receive_text()
             try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
                 data = json.loads(msg)
-                if data.get("type") == "ping":
-                    await websocket.send_json({"type": "pong"})
-                elif data.get("type") == "unsubscribe":
-                    break
-            except asyncio.TimeoutError:
-                pass
-
-            # Fetch and broadcast the latest quote
-            try:
-                quote = await market_data_service.get_quote(symbol)
-                await websocket.send_json({"type": "quote", "data": quote})
-            except Exception as e:
-                await websocket.send_json({"type": "error", "message": str(e)})
-
+            except json.JSONDecodeError:
+                continue
+            if data.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif data.get("type") == "unsubscribe":
+                break
     except WebSocketDisconnect:
-        logger.info(f"WebSocket client disconnected: {symbol}")
+        pass
     finally:
         manager.disconnect(websocket, symbol)
