@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -126,18 +126,50 @@ def _date_str(v: Any) -> Optional[str]:
         return None
 
 
+def _date_range(v: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Yahoo reports an unconfirmed earnings date as a [start, end] estimate window
+    and a confirmed one as a single date. Returns (start, end); end == start for
+    a single date, (None, None) when unparseable.
+    """
+    values = v if isinstance(v, (list, tuple)) else [v]
+    dates = sorted(d for d in (_date_str(x) for x in values if x is not None) if d is not None)
+    if not dates:
+        return None, None
+    return dates[0], dates[-1]
+
+
+def failed_sections(snapshot: Dict[str, Any]) -> List[str]:
+    """
+    Sections whose fetch raised (rate limit, network, parse error) as opposed to
+    sections Yahoo simply has no data for. Older snapshots only carry
+    `data_gaps` strings of the form "section: ErrorType", so fall back to those.
+    """
+    errors = snapshot.get("fetch_errors")
+    if isinstance(errors, list):
+        return [str(e.get("section")) for e in errors if isinstance(e, dict) and e.get("section")]
+    out = []
+    for gap in snapshot.get("data_gaps") or []:
+        m = re.fullmatch(r"([a-z_ ]+): ([A-Za-z_][\w.]*)", str(gap))
+        if m:
+            out.append(m.group(1))
+    return out
+
+
 def fetch_snapshot_sync(symbol: str) -> Dict[str, Any]:
     """Blocking: call from a worker thread."""
     import yfinance as yf
 
     t = yf.Ticker(symbol)
     gaps: List[str] = []
+    errors: List[Dict[str, str]] = []  # sections that FAILED (vs. merely empty)
 
     def attempt(name: str, fn, default=None):
         try:
             return fn()
         except Exception as e:  # noqa: BLE001 - every section is optional
             gaps.append(f"{name}: {type(e).__name__}")
+            errors.append({"section": name, "error": type(e).__name__})
             return default
 
     info = attempt("info", lambda: t.info or {}, {}) or {}
@@ -179,6 +211,13 @@ def fetch_snapshot_sync(symbol: str) -> Dict[str, Any]:
     calendar = attempt("calendar", lambda: t.calendar, {}) or {}
     if not isinstance(calendar, dict):
         calendar = {}
+    earnings_start, earnings_end = _date_range(calendar.get("Earnings Date"))
+
+    # Price/market cap are quoted in the trading currency; statements are in the
+    # reporting currency. They differ for ADRs and many cross-listings (e.g. TSM:
+    # USD per ADR vs. TWD statements), and must never be mixed without FX.
+    trading_currency = info.get("currency") or fast_get("currency") or None
+    financial_currency = info.get("financialCurrency") or trading_currency
 
     summary = (info.get("longBusinessSummary") or "")[:2000]
     return {
@@ -188,7 +227,10 @@ def fetch_snapshot_sync(symbol: str) -> Dict[str, Any]:
             "sector": info.get("sector") or "",
             "industry": info.get("industry") or "",
             "country": info.get("country") or "",
-            "currency": info.get("financialCurrency") or info.get("currency") or "USD",
+            # `currency` is the statement (reporting) currency, kept for compatibility.
+            "currency": financial_currency or "USD",
+            "trading_currency": trading_currency,
+            "financial_currency": financial_currency,
             "employees": info.get("fullTimeEmployees"),
             "website": info.get("website") or "",
             "summary": summary,
@@ -215,8 +257,10 @@ def fetch_snapshot_sync(symbol: str) -> Dict[str, Any]:
         },
         "insider_transactions": insider,
         "calendar": {
-            "next_earnings": _date_str(calendar.get("Earnings Date")),
+            "next_earnings": earnings_start,
+            "next_earnings_end": earnings_end,
             "ex_dividend": _date_str(calendar.get("Ex-Dividend Date")),
         },
         "data_gaps": gaps,
+        "fetch_errors": errors,
     }

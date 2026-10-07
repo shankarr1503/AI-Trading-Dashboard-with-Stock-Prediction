@@ -35,10 +35,13 @@ class SignalService:
         frame = await asyncio.to_thread(compute_factor_frame, df, cfg)
         from backend.research.service import research_service
 
+        # This endpoint is public: fundamentals are included only when already
+        # cached (by the bot or a signed-in research view). It must never start
+        # a ~15-request research fetch on an anonymous caller's behalf.
         prediction, sentiment, fundamental = await asyncio.gather(
             _optional(prediction_service.predict(symbol)),
             _optional(prediction_service.sentiment(symbol)),
-            _optional(research_service.fundamental_view(symbol)),
+            _optional(research_service.cached_fundamental_view(symbol)),
         )
         a = analyze_latest(symbol, frame, cfg, ml=prediction, sentiment=sentiment, fundamental=fundamental)
 

@@ -67,7 +67,9 @@ export default function ResearchPage() {
           {Object.keys(universes).map((u) => <option key={u} value={u}>{u.replace(/_/g, ' ')} ({universes[u].length})</option>)}
         </select>
         <span className="text-xs" style={muted}>or</span>
-        <input value={custom} onChange={(e) => setCustom(e.target.value)} placeholder="custom symbols, e.g. AAPL,MSFT,TCS.NS"
+        <input value={custom} onChange={(e) => setCustom(e.target.value)}
+          placeholder={user.is_superuser ? 'custom symbols, e.g. AAPL,MSFT,TCS.NS' : 'subset of the universes, e.g. AAPL,MSFT,TCS.NS'}
+          title={user.is_superuser ? undefined : 'Non-admin screens are limited to symbols in the predefined universes (max 40)'}
           className="rounded-lg px-2 py-1.5 text-xs font-mono flex-1 min-w-[240px]" style={{ ...box, color: '#e8eaf0' }} />
         <button onClick={run} disabled={busy} className="px-3 py-2 rounded-lg text-xs font-semibold" style={{ background: '#4fa3ff', color: 'white', opacity: busy ? 0.6 : 1 }}>
           {busy ? 'Scoring… (first run fetches fundamentals)' : 'Run screen'}

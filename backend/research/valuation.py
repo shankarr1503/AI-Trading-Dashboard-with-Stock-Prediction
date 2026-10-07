@@ -2,6 +2,10 @@
 Valuation: trading multiples, cost of capital, scenario DCF, reverse DCF and
 (for banks/insurers) a justified price-to-book model.
 
+The DCF discounts free cash flow to the FIRM (levered FCF + after-tax interest)
+at WACC to an enterprise value, then subtracts net debt — discounting levered
+FCF at WACC and subtracting debt again would count the debt twice.
+
 These are models, not oracles: every output carries its assumptions so a
 reader (or the analyst agent) can judge them.
 """
@@ -12,6 +16,13 @@ from typing import Any, Dict, List, Optional
 RISK_FREE = 0.0425      # long-run US 10y Treasury assumption
 EQUITY_RISK_PREMIUM = 0.05
 SCENARIO_PROBS = {"bear": 0.25, "base": 0.50, "bull": 0.25}
+# Justified P/B is only trusted when the base case lands in this band: outside
+# it, book value is not what drives the price (buyback-shrunk equity, fee
+# businesses, write-downs) and clamping would collapse bear/base/bull together.
+PB_VALID_RANGE = (0.3, 4.0)
+PB_BEAR_FLOOR = 0.1
+PRICE_MULTIPLES = ("pe", "forward_pe", "peg", "ev_ebitda", "ev_sales", "price_to_fcf", "fcf_yield",
+                   "earnings_yield", "price_to_book")
 
 
 def _num(x) -> Optional[float]:
@@ -92,16 +103,19 @@ def value_company(snapshot: Dict[str, Any], fundamentals: Dict[str, Any]) -> Dic
     price = _num(market.get("price"))
     market_cap = _num(market.get("market_cap"))
     m = fundamentals.get("metrics", {}) if fundamentals.get("available") else {}
+    from backend.research.fundamentals import currency_info, merge_annual
+
     latest = {}
     if fundamentals.get("available"):
-        from backend.research.fundamentals import merge_annual
-
         periods = merge_annual(snapshot)
         latest = periods[sorted(periods)[-1]]
+    currency = fundamentals.get("currency") or currency_info(snapshot)
+    mismatch = bool(currency.get("mismatch"))
 
     total_debt = _num(latest.get("total_debt")) or _num(info.get("totalDebt"))
     cash = _num(latest.get("cash")) or _num(info.get("totalCash"))
-    ev = market_cap + (total_debt or 0) - (cash or 0) if market_cap else None
+    # EV adds a trading-currency market cap to statement-currency debt/cash.
+    ev = market_cap + (total_debt or 0) - (cash or 0) if market_cap and not mismatch else None
     shares = _num(latest.get("diluted_shares")) or _num(market.get("shares_outstanding"))
     if (not shares) and market_cap and price:
         shares = market_cap / price
@@ -127,16 +141,26 @@ def value_company(snapshot: Dict[str, Any], fundamentals: Dict[str, Any]) -> Dic
         "price_to_book": ratio(market_cap, equity) or info.get("priceToBook"),
         "dividend_yield": market.get("dividend_yield"),
     }
+    warnings: List[str] = []
+    if mismatch:
+        # Price is per trading-currency share (often per ADR); statements are in
+        # another currency (and often per ordinary share). Without FX conversion
+        # every price-vs-fundamentals ratio is meaningless, so report none.
+        multiples.update({k: None for k in PRICE_MULTIPLES})
+        warnings.append(f"Financial statements are reported in {currency.get('financial')} but the stock trades in "
+                        f"{currency.get('trading')}: price multiples and intrinsic value are not computed "
+                        f"(no FX conversion)")
 
     tax_rate = m.get("tax_rate") if m.get("tax_rate") is not None else 0.21
-    coc = cost_of_capital(_num(market.get("beta")), market_cap, total_debt, _num(latest.get("interest_expense")), tax_rate)
+    # Capital-structure weights would mix currencies too: fall back to equity-only.
+    coc = cost_of_capital(_num(market.get("beta")), market_cap, None if mismatch else total_debt,
+                          _num(latest.get("interest_expense")), tax_rate)
     wacc = coc["wacc"]
 
     assumptions: List[str] = [
         f"Risk-free {RISK_FREE:.2%}, equity risk premium {EQUITY_RISK_PREMIUM:.1%}, beta {coc['beta_used']}",
-        f"WACC {wacc:.2%} (clamped to 6–14%)",
+        f"WACC {wacc:.2%} (clamped to 6–14%)" + (" — equity-only weights (currency mismatch)" if mismatch else ""),
     ]
-    warnings: List[str] = []
     scenarios: Dict[str, Dict[str, Any]] = {}
     method = "none"
     implied = None
@@ -153,39 +177,53 @@ def value_company(snapshot: Dict[str, Any], fundamentals: Dict[str, Any]) -> Dic
         sources.append(f"historical revenue CAGR {hist_g:.1%}")
     assumptions.append(f"Base growth {base_g:.1%} ({', '.join(sources) or 'default'}), clamped to −5%…25%")
 
-    if fundamentals.get("is_financial"):
+    fcff_base = None
+    if mismatch:
+        pass  # warned above: no intrinsic value across currencies
+    elif fundamentals.get("is_financial"):
         roe = m.get("roe")
-        if roe is not None and equity and shares and equity > 0:
+        coe = coc["cost_of_equity"]
+        g = 0.03
+        if roe is not None and equity and shares and equity > 0 and coe > g:
             bvps = equity / shares
-            coe = coc["cost_of_equity"]
-            g = 0.03
-            method = "justified_pb"
-            for name, roe_adj in (("bear", -0.03), ("base", 0.0), ("bull", 0.03)):
-                r = roe + roe_adj
-                pb = min(max((r - g) / (coe - g), 0.3), 4.0) if coe > g else None
-                scenarios[name] = {"value": round(bvps * pb, 2) if pb else None, "roe": round(r, 4),
-                                   "probability": SCENARIO_PROBS[name]}
-            assumptions.append(f"Justified P/B = (ROE − g)/(COE − g), g = {g:.0%}, COE {coe:.2%}")
+            base_pb = (roe - g) / (coe - g)
+            lo, hi = PB_VALID_RANGE
+            if lo <= base_pb <= hi:
+                method = "justified_pb"
+                for name, roe_adj in (("bear", -0.03), ("base", 0.0), ("bull", 0.03)):
+                    r = roe + roe_adj
+                    pb = max((r - g) / (coe - g), PB_BEAR_FLOOR)
+                    scenarios[name] = {"value": round(bvps * pb, 2), "roe": round(r, 4), "pb": round(pb, 3),
+                                       "probability": SCENARIO_PROBS[name]}
+                assumptions.append(f"Justified P/B = (ROE − g)/(COE − g), g = {g:.0%}, COE {coe:.2%}: base "
+                                   f"{base_pb:.2f}x book; scenarios ROE ±3pp (floored at {PB_BEAR_FLOOR}x book)")
+            else:
+                warnings.append(
+                    f"Justified P/B not applicable: ROE {roe:.1%} vs cost of equity {coe:.2%} implies "
+                    f"{base_pb:.2f}x book, outside the model's {lo}–{hi}x validity range (book value does not "
+                    f"anchor this business): no intrinsic value")
         else:
             warnings.append("Financial company without usable ROE/book value: no intrinsic value")
     else:
-        hist_fcf = [h.get("fcf") for h in fundamentals.get("history", []) if h.get("fcf") is not None]
-        recent = hist_fcf[-3:]
-        fcf_base = None
+        hist = [h.get("fcff", h.get("fcf")) for h in fundamentals.get("history", [])]
+        recent = [x for x in hist if x is not None][-3:]
         if recent and recent[-1] > 0 and sum(recent) > 0:
-            fcf_base = 0.5 * recent[-1] + 0.5 * (sum(recent) / len(recent))
-        if fcf_base and shares and ev is not None:
+            fcff_base = 0.5 * recent[-1] + 0.5 * (sum(recent) / len(recent))
+        if fcff_base and shares and ev is not None:
             net_debt = (total_debt or 0) - (cash or 0)
             method = "dcf"
             for name, dg, tg, dw in (("bear", -0.06, 0.02, 0.01), ("base", 0.0, 0.025, 0.0), ("bull", 0.05, 0.03, -0.005)):
                 g = min(max(base_g + dg, -0.10), 0.35)
                 w = wacc + dw
-                ev_dcf = dcf_enterprise_value(fcf_base, g, tg, w)
+                ev_dcf = dcf_enterprise_value(fcff_base, g, tg, w)
                 per_share = max(0.0, (ev_dcf - net_debt) / shares)
                 scenarios[name] = {"value": round(per_share, 2), "growth": round(g, 4), "terminal_growth": tg,
                                    "wacc": round(w, 4), "probability": SCENARIO_PROBS[name]}
-            implied = implied_growth(ev, fcf_base, 0.025, wacc)
-            assumptions.append(f"Normalised FCF {fcf_base:,.0f} (blend of latest and 3-year average)")
+            implied = implied_growth(ev, fcff_base, 0.025, wacc)
+            assumptions.append(f"Normalised FCFF {fcff_base:,.0f} (levered FCF + after-tax interest; blend of latest "
+                               f"and 3-year average), discounted at WACC, less net debt {net_debt:,.0f}")
+            if latest.get("interest_expense") is None and (total_debt or 0) > 0:
+                assumptions.append("Interest expense not reported: FCFF taken as levered FCF (conservative)")
         else:
             warnings.append("Free cash flow is negative or unavailable: DCF not meaningful")
 
@@ -203,6 +241,8 @@ def value_company(snapshot: Dict[str, Any], fundamentals: Dict[str, Any]) -> Dic
         "multiples": multiples,
         "cost_of_capital": coc,
         "method": method,
+        "currency": currency,
+        "fcff_base": round(fcff_base, 2) if fcff_base else None,
         "scenarios": scenarios,
         "fair_value": fair_value,
         "upside_pct": round((fair_value / price - 1) * 100, 2) if fair_value and price else None,

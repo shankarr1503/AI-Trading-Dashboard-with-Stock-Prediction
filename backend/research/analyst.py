@@ -23,6 +23,53 @@ logger = logging.getLogger(__name__)
 
 RATINGS = ["STRONG_BUY", "BUY", "HOLD", "SELL", "STRONG_SELL"]
 MAX_TURNS = 12
+MAX_SUBMIT_ATTEMPTS = 3  # invalid submit_report calls are sent back for correction this many times
+
+
+class AnalystError(RuntimeError):
+    """A failed Claude run. Carries what it cost so far (`usage`) and the model that ran."""
+
+    def __init__(self, message: str, usage: Optional[Dict[str, int]] = None, model: Optional[str] = None):
+        super().__init__(message)
+        self.usage = usage
+        self.model = model
+
+
+USAGE_TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def empty_usage() -> Dict[str, int]:
+    return {**{k: 0 for k in USAGE_TOKEN_FIELDS}, "web_search_requests": 0, "api_calls": 0, "fallback_attempts": 0}
+
+
+def _field(obj: Any, key: str) -> Any:
+    if obj is None:
+        return None
+    return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+
+def add_usage(acc: Dict[str, int], u: Any) -> Dict[str, int]:
+    """
+    Accumulate one response's usage. With server-side fallbacks the top-level
+    usage covers only the attempt that produced the returned message, while
+    `usage.iterations` lists every attempt (declined attempts and fallback
+    hops included) — so sum the iterations when present. Cache writes/reads
+    and server-side web searches are billed separately and are tracked too.
+    """
+    acc["api_calls"] += 1
+    if u is None:
+        return acc
+    iterations = _field(u, "iterations")
+    entries = list(iterations) if iterations else [u]
+    for e in entries:
+        for k in USAGE_TOKEN_FIELDS:
+            acc[k] += int(_field(e, k) or 0)
+        if _field(e, "type") == "fallback_message":
+            acc["fallback_attempts"] += 1
+    per_attempt = [_field(e, "server_tool_use") for e in entries] if iterations else []
+    tool_use = per_attempt if any(x is not None for x in per_attempt) else [_field(u, "server_tool_use")]
+    acc["web_search_requests"] += sum(int(_field(t, "web_search_requests") or 0) for t in tool_use if t is not None)
+    return acc
 
 SYSTEM_PROMPT = """You are a senior equity research analyst writing an institutional-quality report.
 
@@ -153,6 +200,13 @@ def quant_report(dossier: Dict[str, Any]) -> Dict[str, Any]:
     distressed = (fund.get("altman") or {}).get("zone") == "distress"
     if distressed:
         signal = min(signal, -0.2)
+    # A STRONG call needs a valuation anchor. When neither an intrinsic value nor
+    # any value metric is available (e.g. statements and price in different
+    # currencies), quality/growth/momentum alone cannot justify one.
+    value_score = (sc.get("factors", {}).get("value") or {}).get("score")
+    valuation_known = upside is not None or value_score is not None
+    if not valuation_known:
+        signal = max(-0.45, min(0.45, signal))
     rating = ("STRONG_BUY" if signal > 0.45 else "BUY" if signal > 0.15 else "HOLD" if signal > -0.15
               else "SELL" if signal > -0.45 else "STRONG_SELL")
 
@@ -190,6 +244,8 @@ def quant_report(dossier: Dict[str, Any]) -> Dict[str, Any]:
     gaps = list(snap.get("data_gaps", [])) + list(val.get("warnings", []))
     if sc.get("coverage", 0) < 0.6:
         gaps.append(f"Scorecard coverage only {sc.get('coverage', 0):.0%}")
+    if not valuation_known:
+        gaps.append("No valuation input available: rating limited to BUY/HOLD/SELL")
 
     raw = {
         "rating": rating,
@@ -236,7 +292,12 @@ class ClaudeAnalyst:
         return self._client
 
     async def write_report(self, symbol: str, price: Optional[float], tool_handler: ToolHandler) -> Dict[str, Any]:
-        """Run the agent loop. Raises RuntimeError if no valid report is produced."""
+        """
+        Run the agent loop. A submit_report that fails validation is returned to
+        the model as an error tool_result so it can correct and resubmit (the
+        run is paid for — don't throw it away over one inconsistent target).
+        Raises AnalystError (with the usage spent so far) if no valid report is produced.
+        """
         client = self._get_client()
         tools = list(TOOLS)
         if self.web_search:
@@ -245,49 +306,69 @@ class ClaudeAnalyst:
             "role": "user",
             "content": f"Write a research report on {symbol}. Current price: {price}. Use the tools, then call submit_report.",
         }]
-        usage = {"input_tokens": 0, "output_tokens": 0}
-        for _ in range(MAX_TURNS):
-            resp = await client.beta.messages.create(
-                model=self.model,
-                max_tokens=16000,
-                system=SYSTEM_PROMPT,
-                tools=tools,
-                tool_choice={"type": "auto"},
-                output_config={"effort": "high"},
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
-                messages=messages,
-            )
-            u = getattr(resp, "usage", None)
-            if u is not None:
-                usage["input_tokens"] += getattr(u, "input_tokens", 0) or 0
-                usage["output_tokens"] += getattr(u, "output_tokens", 0) or 0
-            if resp.stop_reason == "refusal":
-                raise RuntimeError("model declined the request")
-            if resp.stop_reason == "max_tokens":
-                raise RuntimeError("response truncated")
-            messages.append({"role": "assistant", "content": resp.content})
-            if resp.stop_reason == "pause_turn":
-                continue  # server tool (web search) paused; resend to let it continue
+        usage = empty_usage()
+        model_used = self.model
+        rejected = 0
+        try:
+            for _ in range(MAX_TURNS):
+                resp = await client.beta.messages.create(
+                    model=self.model,
+                    max_tokens=16000,
+                    system=SYSTEM_PROMPT,
+                    tools=tools,
+                    tool_choice={"type": "auto"},
+                    output_config={"effort": "high"},
+                    betas=["server-side-fallback-2026-07-01"],
+                    fallbacks="default",
+                    messages=messages,
+                )
+                add_usage(usage, getattr(resp, "usage", None))
+                model_used = getattr(resp, "model", None) or model_used
+                if resp.stop_reason == "refusal":
+                    raise AnalystError("model declined the request", usage, model_used)
+                if resp.stop_reason == "max_tokens":
+                    raise AnalystError("response truncated", usage, model_used)
+                messages.append({"role": "assistant", "content": resp.content})
+                if resp.stop_reason == "pause_turn":
+                    continue  # server tool (web search) paused; resend to let it continue
 
-            calls = [b for b in resp.content if b.type == "tool_use"]
-            final = next((b for b in calls if b.name == "submit_report"), None)
-            if final is not None:
-                report = validate_report(dict(final.input), price)
-                report["usage"] = usage
-                report["model"] = getattr(resp, "model", self.model)
-                return report
-            if not calls:
-                messages.append({"role": "user", "content": "Please call submit_report with your completed report."})
-                continue
-            results = []
-            for block in calls:
-                try:
-                    out = await tool_handler(block.name, dict(block.input))
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": json.dumps(out, default=str)[:40000]})
-                except Exception as e:
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": f"Tool error: {e}", "is_error": True})
-            messages.append({"role": "user", "content": results})
-        raise RuntimeError("no report after maximum turns")
+                calls = [b for b in resp.content if b.type == "tool_use"]
+                if not calls:
+                    messages.append({"role": "user", "content": "Please call submit_report with your completed report."})
+                    continue
+                submission_error = None
+                final = next((b for b in calls if b.name == "submit_report"), None)
+                if final is not None:
+                    try:
+                        report = validate_report(dict(final.input), price)
+                    except (ValueError, TypeError, KeyError) as e:
+                        rejected += 1
+                        submission_error = str(e) or type(e).__name__
+                        if rejected >= MAX_SUBMIT_ATTEMPTS:
+                            raise AnalystError(f"report failed validation {rejected} times: {submission_error}",
+                                               usage, model_used) from e
+                    else:
+                        report["usage"] = usage
+                        report["model"] = model_used
+                        return report
+                # Every tool_use needs a tool_result, all in one user message.
+                results = []
+                for block in calls:
+                    if block.name == "submit_report":
+                        results.append({"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                                        "content": f"Report rejected: {submission_error}. Fix this and call "
+                                                   f"submit_report again with the complete corrected report."})
+                        continue
+                    try:
+                        out = await tool_handler(block.name, dict(block.input))
+                        results.append({"type": "tool_result", "tool_use_id": block.id,
+                                        "content": json.dumps(out, default=str)[:40000]})
+                    except Exception as e:
+                        results.append({"type": "tool_result", "tool_use_id": block.id,
+                                        "content": f"Tool error: {e}", "is_error": True})
+                messages.append({"role": "user", "content": results})
+        except AnalystError:
+            raise
+        except Exception as e:  # API/network error mid-run: keep the cost of the turns already made
+            raise AnalystError(f"{type(e).__name__}: {e}", usage, model_used) from e
+        raise AnalystError("no report after maximum turns", usage, model_used)

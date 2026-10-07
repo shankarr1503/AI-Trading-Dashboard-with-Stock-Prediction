@@ -173,8 +173,10 @@ export const botApi = {
 // Equity research
 export const researchApi = {
   fundamentals: (symbol: string) => api.get(`/api/research/${enc(symbol)}/fundamentals`),
-  report: (symbol: string, refresh = false) =>
-    api.get(`/api/research/${enc(symbol)}/report`, { params: { refresh }, timeout: 300000 }),
+  // Reads the latest stored report (or a free rules-based one); never runs the paid AI analyst.
+  report: (symbol: string) => api.get(`/api/research/${enc(symbol)}/report`),
+  // Explicitly generates a new report: the paid AI analyst for administrators, rules-based otherwise.
+  generateReport: (symbol: string) => api.post(`/api/research/${enc(symbol)}/report`, null, { timeout: 300000 }),
   reports: () => api.get('/api/research/reports'),
   universes: () => api.get('/api/research/universes'),
   screen: (body: { symbols?: string[]; universe?: string }) => api.post('/api/research/screen', body, { timeout: 300000 }),

@@ -17,6 +17,9 @@ import pandas as pd
 FACTOR_WEIGHTS = {"value": 0.20, "quality": 0.25, "growth": 0.15, "momentum": 0.20, "low_risk": 0.10, "street": 0.10}
 
 # Metrics that are meaningless for one kind of company are excluded, not scored 0.
+# (Metrics that are merely *unavailable* — e.g. price multiples when the
+# statements and the price are in different currencies — stay in the
+# denominator unscored, so coverage drops honestly.)
 FINANCIALS_ONLY = {"price_to_book", "roe"}
 NOT_FOR_FINANCIALS = {"fcf_yield", "ev_ebitda", "gross_margin", "interest_coverage", "net_debt_to_ebitda",
                       "cash_conversion", "fcf_cagr"}
@@ -135,11 +138,19 @@ def score(fundamentals: Dict[str, Any], valuation: Dict[str, Any], snapshot: Dic
 
     weighted = [(FACTOR_WEIGHTS[k], f["score"]) for k, f in factors.items() if f["score"] is not None]
     composite = round(sum(w * s for w, s in weighted) / sum(w for w, _ in weighted), 1) if weighted else None
+    notes: List[str] = []
+    currency = valuation.get("currency") or fundamentals.get("currency") or {}
+    if currency.get("mismatch"):
+        notes.append(f"Statements in {currency.get('financial')} vs price in {currency.get('trading')}: value "
+                     f"metrics unavailable (not scored)")
+    if factors["value"]["score"] is None:
+        notes.append("No value metric available: composite excludes valuation")
     return {
         "composite": composite,
         "factors": factors,
         "weights": FACTOR_WEIGHTS,
         "coverage": round(used / total, 3) if total else 0.0,
+        "notes": notes,
     }
 
 

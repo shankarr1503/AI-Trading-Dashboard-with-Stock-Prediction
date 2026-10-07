@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { FiBookOpen, FiRefreshCw } from 'react-icons/fi';
+import { FiBookOpen, FiCpu, FiRefreshCw } from 'react-icons/fi';
 import { errorMessage, researchApi } from '@/lib/api';
 import { useAuth } from '@/lib/useAuth';
 
@@ -59,16 +59,32 @@ export default function ResearchReport({ symbol }: { symbol: string }) {
   const [dossier, setDossier] = useState<any>(null);
   const [report, setReport] = useState<any>(null);
   const [loading, setLoading] = useState(false);
+  const [generating, setGenerating] = useState(false);
   const [error, setError] = useState('');
 
-  const load = async (refresh = false) => {
+  // Page load / refresh only reads: it never starts a paid AI analyst run.
+  const load = async () => {
     setLoading(true);
     setError('');
-    const [d, r] = await Promise.allSettled([researchApi.fundamentals(symbol), researchApi.report(symbol, refresh)]);
+    const [d, r] = await Promise.allSettled([researchApi.fundamentals(symbol), researchApi.report(symbol)]);
     if (d.status === 'fulfilled') setDossier(d.value.data); else setDossier(null);
     if (r.status === 'fulfilled') setReport(r.value.data); else setReport(null);
     if (d.status === 'rejected' && r.status === 'rejected') setError(errorMessage(r.reason, 'Research unavailable for this symbol.'));
     setLoading(false);
+  };
+
+  // Explicit, admin-only action: runs the Claude analyst (costs API credits).
+  const generate = async () => {
+    if (!window.confirm(`Generate a new AI analyst report for ${symbol}? This uses Claude API credits and can take a few minutes.`)) return;
+    setGenerating(true);
+    setError('');
+    try {
+      const r = await researchApi.generateReport(symbol);
+      setReport(r.data);
+    } catch (e) {
+      setError(errorMessage(e, 'Report generation failed.'));
+    }
+    setGenerating(false);
   };
 
   useEffect(() => {
@@ -82,6 +98,8 @@ export default function ResearchReport({ symbol }: { symbol: string }) {
   }
 
   const rep = report?.report;
+  const canGenerate = Boolean(user.is_superuser && report?.ai_generation_available);
+  const usage = report?.usage;
   const f = dossier?.fundamentals;
   const m = f?.metrics || {};
   const v = dossier?.valuation;
@@ -107,7 +125,15 @@ export default function ResearchReport({ symbol }: { symbol: string }) {
                 {rep.rating.replace('_', ' ')} · {rep.conviction}/5
               </span>
             )}
-            <button onClick={() => load(true)} disabled={loading} title={user.is_superuser ? 'Generate a new report' : 'Refresh'}
+            {canGenerate && (
+              <button onClick={generate} disabled={generating || loading} title="Run the AI analyst (uses Claude API credits)"
+                className="px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5"
+                style={{ background: '#4fa3ff', color: 'white', opacity: generating || loading ? 0.6 : 1 }}>
+                <FiCpu className={generating ? 'animate-pulse' : ''} />
+                {generating ? 'Generating…' : 'Generate AI report'}
+              </button>
+            )}
+            <button onClick={() => load()} disabled={loading || generating} title="Reload research data"
               className="p-2 rounded-lg" style={box}>
               <FiRefreshCw className={loading ? 'animate-spin' : ''} style={muted} />
             </button>
@@ -116,6 +142,13 @@ export default function ResearchReport({ symbol }: { symbol: string }) {
         {report && (
           <p className="text-xs mt-2" style={muted}>
             {report.source === 'claude' ? `AI analyst (${report.model})` : 'Rules-based quant report'} · {new Date(report.created_at).toLocaleString()}
+            {usage && usage.api_calls ? ` · ${usage.api_calls} API calls, ${big(usage.input_tokens)} in / ${big(usage.output_tokens)} out tokens` : ''}
+            {usage && usage.web_search_requests ? `, ${usage.web_search_requests} web searches` : ''}
+          </p>
+        )}
+        {rep?.llm_failed && (
+          <p className="text-xs mt-1" style={{ color: '#ff8a5c' }}>
+            The last AI analyst run failed ({rep.llm_error}); showing the rules-based report. It will not be retried automatically for a few hours.
           </p>
         )}
         {error && <p className="text-xs mt-2" style={{ color: '#ff4757' }}>{error}</p>}
@@ -183,6 +216,9 @@ export default function ResearchReport({ symbol }: { symbol: string }) {
             <div className="space-y-2">
               {Object.entries(card.factors).map(([k, fct]: any) => <ScoreBar key={k} label={k.replace('_', ' ')} value={fct.score} />)}
             </div>
+            {card.notes?.length > 0 && (
+              <ul className="text-xs mt-3 space-y-0.5" style={muted}>{card.notes.map((x: string) => <li key={x}>• {x}</li>)}</ul>
+            )}
           </Section>
         )}
 
@@ -198,7 +234,8 @@ export default function ResearchReport({ symbol }: { symbol: string }) {
               ['Cash conversion (FCF/NI)', num(m.cash_conversion, 2)],
               ['Share count change', pct(m.share_count_change)],
               ['Piotroski F-score', f.piotroski?.score !== null ? `${f.piotroski.score}/9` : 'n/a'],
-              ['Altman Z', f.altman?.z !== null && f.altman?.z !== undefined ? `${f.altman.z} (${f.altman.zone})` : f.altman?.zone],
+              [f.altman?.model === 'z_double_prime' ? "Altman Z'' (non-mfg)" : f.altman?.model === 'z_prime' ? "Altman Z' (book)" : 'Altman Z',
+                f.altman?.z !== null && f.altman?.z !== undefined ? `${f.altman.z} (${f.altman.zone})` : String(f.altman?.zone ?? '—').replace('_', ' ')],
             ]} />
             {f.flags?.length > 0 && (
               <ul className="text-xs mt-3 space-y-0.5" style={{ color: '#ff8a5c' }}>{f.flags.map((x: string) => <li key={x}>⚠ {x}</li>)}</ul>
