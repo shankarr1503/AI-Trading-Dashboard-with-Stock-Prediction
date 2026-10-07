@@ -40,7 +40,7 @@ export default function LoginPage() {
             AI<span style={{ color: '#4fa3ff' }}>Trade</span>
           </h1>
           <p className="text-xs mt-1" style={{ color: '#5a6478' }}>
-            {mode === 'login' ? 'Sign in to your account' : 'Create an account (the first account becomes the administrator)'}
+            {mode === 'login' ? 'Sign in to your account' : 'Create an account'}
           </p>
         </div>
         <label className="block space-y-1">

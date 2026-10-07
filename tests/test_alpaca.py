@@ -1,6 +1,7 @@
 """AlpacaBroker against an in-memory Alpaca API simulator (httpx.MockTransport)."""
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -17,16 +18,46 @@ class FakeAlpaca:
         self.positions = {}
         self.fill_after = fill_after_polls
         self.fill_price = fill_price
+        self.prices = {}                 # per-symbol fill/mark price (falls back to fill_price)
         self.reject_market_sells = reject_market_sells
         self.never_fill = never_fill
         self.polls = {}
         self.requests = []
         self.activities = []
+        self.client_ids = set()
+        self.cash = 100_000.0
+        self.lose_next_post_response = False
+        self.patch_fails = False
+
+    def px(self, sym):
+        return self.prices.get(sym, self.fill_price)
+
+    @staticmethod
+    def now():
+        return datetime.now(timezone.utc).isoformat()
 
     def _order(self, **kw):
-        o = {"id": uuid.uuid4().hex, "status": "new", "filled_qty": "0", "filled_avg_price": None, "legs": None, **kw}
+        o = {"id": uuid.uuid4().hex, "status": "new", "filled_qty": "0", "filled_avg_price": None, "legs": None,
+             "submitted_at": self.now(), "filled_at": None, **kw}
         self.orders[o["id"]] = o
         return o
+
+    def fill_leg(self, symbol, leg_type, price):
+        """A resting bracket leg fills between cycles (e.g. the stop is hit)."""
+        for o in self.orders.values():
+            for leg in o.get("legs") or []:
+                if leg["symbol"] == symbol and leg["type"] == leg_type and leg["status"] in ("new", "held", "accepted"):
+                    leg.update(status="filled", filled_qty=leg["qty"], filled_avg_price=str(price), filled_at=self.now())
+                    for other in o["legs"]:
+                        if other is not leg and other["status"] not in ("filled", "canceled"):
+                            other["status"] = "canceled"
+                    cur = self.positions[symbol]
+                    cur["qty"] -= float(leg["qty"])
+                    self.cash += float(leg["qty"]) * price
+                    if cur["qty"] <= 0:
+                        self.positions.pop(symbol)
+                    return leg
+        raise AssertionError(f"no live {leg_type} leg for {symbol}")
 
     def _tick(self, o):
         """Advance an order's state when it is polled."""
@@ -36,11 +67,13 @@ class FakeAlpaca:
         if o["status"] in ("new", "accepted") and o.get("type") == "market" and not self.never_fill:
             self.polls[o["id"]] = self.polls.get(o["id"], 0) + 1
             if self.polls[o["id"]] >= self.fill_after:
-                o.update(status="filled", filled_qty=o["qty"], filled_avg_price=str(self.fill_price))
+                o.update(status="filled", filled_qty=o["qty"], filled_avg_price=str(self.px(o["symbol"])),
+                         filled_at=self.now())
                 sym, q = o["symbol"], float(o["qty"])
                 cur = self.positions.get(sym, {"qty": 0.0, "avg": 0.0})
+                self.cash += -q * self.px(sym) if o["side"] == "buy" else q * self.px(sym)
                 if o["side"] == "buy":
-                    cur = {"qty": cur["qty"] + q, "avg": self.fill_price}
+                    cur = {"qty": cur["qty"] + q, "avg": self.px(sym)}
                     for leg in o.get("legs") or []:
                         leg["status"] = "new"
                 else:
@@ -55,6 +88,11 @@ class FakeAlpaca:
         path, m = request.url.path, request.method
         body = json.loads(request.content) if request.content else {}
         if path == "/v2/orders" and m == "POST":
+            coid = body.get("client_order_id")
+            if coid and coid in self.client_ids:
+                return httpx.Response(422, json={"code": 40010001, "message": "client_order_id must be unique"})
+            if coid:
+                self.client_ids.add(coid)
             if body.get("type") == "market" and body["side"] == "sell" and self.reject_market_sells:
                 return httpx.Response(403, json={"message": "insufficient qty available"})
             legs = None
@@ -67,10 +105,19 @@ class FakeAlpaca:
                                             limit_price=body["take_profit"]["limit_price"], status="held",
                                             time_in_force=body["time_in_force"]))
             o = self._order(**{k: v for k, v in body.items() if k not in ("stop_loss", "take_profit")}, legs=legs)
+            if self.lose_next_post_response:          # accepted by Alpaca, but the response never arrives
+                self.lose_next_post_response = False
+                self._tick(o)
+                raise httpx.ReadTimeout("response lost", request=request)
             return httpx.Response(200, json=o)
+        if path == "/v2/orders:by_client_order_id" and m == "GET":
+            coid = request.url.params.get("client_order_id")
+            o = next((o for o in self.orders.values() if o.get("client_order_id") == coid), None)
+            return httpx.Response(200, json=o) if o else httpx.Response(404, json={"message": "order not found"})
         if path == "/v2/orders" and m == "GET":
             sym = request.url.params.get("symbols")
             status = request.url.params.get("status")
+            after = request.url.params.get("after")   # Alpaca filters on submission time
             leg_ids = {leg["id"] for o in self.orders.values() for leg in (o.get("legs") or [])}
             out = []
             for o in self.orders.values():
@@ -78,6 +125,8 @@ class FakeAlpaca:
                     continue
                 live = o["status"] not in ("filled", "canceled", "expired", "rejected") or \
                     any(leg["status"] not in ("canceled", "filled") for leg in o.get("legs") or [])
+                if after and datetime.fromisoformat(o["submitted_at"]) <= datetime.fromisoformat(after):
+                    continue
                 if (status == "open" and live) or (status == "closed" and not live):
                     out.append(o)
             return httpx.Response(200, json=out)
@@ -94,6 +143,8 @@ class FakeAlpaca:
             o["status"] = "pending_cancel"
             return httpx.Response(204)
         if path.startswith("/v2/orders/") and m == "PATCH":
+            if self.patch_fails:
+                return httpx.Response(500, json={"message": "internal error"})
             o = self.orders[path.rsplit("/", 1)[1]]
             o["stop_price"] = body["stop_price"]
             return httpx.Response(200, json=o)
@@ -105,7 +156,10 @@ class FakeAlpaca:
             return httpx.Response(200, json={"symbol": sym, "qty": str(p["qty"]), "avg_entry_price": str(p["avg"])})
         if path == "/v2/positions":
             return httpx.Response(200, json=[{"symbol": s, "qty": str(p["qty"]), "avg_entry_price": str(p["avg"]),
-                                              "current_price": str(self.fill_price)} for s, p in self.positions.items()])
+                                              "current_price": str(self.px(s))} for s, p in self.positions.items()])
+        if path == "/v2/account":
+            mv = sum(p["qty"] * self.px(s) for s, p in self.positions.items())
+            return httpx.Response(200, json={"equity": str(self.cash + mv), "cash": str(self.cash)})
         if path == "/v2/account/activities":
             return httpx.Response(200, json=self.activities)
         if path == "/v2/clock":
@@ -178,7 +232,10 @@ async def test_ensure_protection_and_trailing_update():
 
 async def test_cash_flows_signed():
     fake = FakeAlpaca()
-    fake.activities = [{"activity_type": "CSD", "net_amount": "5000"}, {"activity_type": "CSW", "net_amount": "-12000"}]
+    fake.activities = [{"id": "a1", "activity_type": "CSD", "net_amount": "5000"},
+                       {"id": "a2", "activity_type": "CSW", "net_amount": "-12000"}]
     from datetime import datetime, timezone
 
-    assert await broker(fake).get_net_cash_flows(datetime.now(timezone.utc)) == pytest.approx(-7000)
+    acts = await broker(fake).get_cash_activities(datetime.now(timezone.utc))
+    assert [a["id"] for a in acts] == ["a1", "a2"]
+    assert sum(a["amount"] for a in acts) == pytest.approx(-7000)

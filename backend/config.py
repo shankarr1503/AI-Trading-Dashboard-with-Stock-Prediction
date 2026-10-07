@@ -57,10 +57,9 @@ class Settings(BaseSettings):
     NEWS_API_KEY: str = ""
 
     # ─── Accounts ────────────────────────────────────────────────────────────
-    # The account registering with this email becomes the administrator. If
-    # empty, only in development does the first account become admin;
-    # otherwise create one with `python -m backend.manage create-admin`.
-    BOOTSTRAP_ADMIN_EMAIL: str = ""
+    # Registration never grants admin outside development (there is no email
+    # verification, so an email address proves nothing). Create the
+    # administrator with `python -m backend.manage create-admin`.
     REGISTRATION_OPEN: bool = True
 
     # ─── CORS ────────────────────────────────────────────────────────────────

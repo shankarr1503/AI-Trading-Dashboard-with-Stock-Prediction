@@ -137,14 +137,15 @@ def test_bot_health_endpoint(client):
     assert r.status_code == 503 and r.json()["healthy"] is False   # no cycle has run yet
 
 
-def test_registration_bootstrap_and_closing(client, monkeypatch):
+def test_registration_never_grants_admin_outside_development(client, monkeypatch):
     from backend.config import settings
 
-    monkeypatch.setattr(settings, "BOOTSTRAP_ADMIN_EMAIL", "boss@example.com")
+    monkeypatch.setattr(settings, "APP_ENV", "production")
     first, _, _ = register(client, "mallory")
-    assert not first["is_superuser"]                      # first-come is no longer admin
-    boss, _, _ = register(client, "boss")
-    assert boss["is_superuser"]
+    assert not first["is_superuser"]          # an email address proves nothing: admins come from the CLI
+    r = client.post("/auth/register", json={"email": "MALLORY@example.com", "username": "mallory2", "password": "x" * 12})
+    assert r.status_code == 400               # case variants are the same account
+    monkeypatch.setattr(settings, "APP_ENV", "test")
     monkeypatch.setattr(settings, "REGISTRATION_OPEN", False)
     r = client.post("/auth/register", json={"email": "late@example.com", "username": "late", "password": "x" * 12})
     assert r.status_code == 403

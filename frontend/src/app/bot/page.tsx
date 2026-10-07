@@ -147,13 +147,14 @@ export default function BotPage() {
           <FiAlertTriangle /> <span className="text-sm">Halted: {status.halt_reason}{status.flatten_requested ? ' — flatten pending (positions close at the next open market)' : ''}</span>
         </div>
       )}
-      {status && (status.stale || status.consecutive_failures > 0 || status.consecutive_data_faults > 0) && (
+      {status && (status.stale || status.consecutive_failures > 0 || status.consecutive_data_faults > 0 || status.config_error) && (
         <div className="flex items-start gap-2 p-3 rounded-xl" style={{ background: '#ffd70012', border: '1px solid #ffd70055', color: '#ffd700' }}>
           <FiAlertTriangle className="mt-0.5" />
           <div className="text-sm space-y-0.5">
             {status.stale && <p>No recent cycle{status.last_cycle_at ? ` since ${new Date(status.last_cycle_at).toLocaleString()}` : ''} — is the bot runner process running?</p>}
             {status.consecutive_failures > 0 && <p>{status.consecutive_failures} consecutive failed cycle(s): {status.last_error}</p>}
-            {status.consecutive_data_faults > 0 && <p>Market data missing for held positions ({status.consecutive_data_faults} cycle(s)): entries paused, breakers frozen.</p>}
+            {status.consecutive_data_faults > 0 && <p>Untrusted market data or unreadable cash flows ({status.consecutive_data_faults} cycle(s)): entries paused, breakers frozen.</p>}
+            {status.config_error && <p>Stored risk settings are invalid ({status.config_error}): defaults in use, entries blocked until fixed.</p>}
           </div>
         </div>
       )}

@@ -15,6 +15,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
@@ -28,6 +29,16 @@ from backend.trading.costs import cost_model_for
 from backend.trading.markets import exchange_for, is_regular_session
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_ts(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
 @dataclass
@@ -62,6 +73,8 @@ class OrderResult:
 class PaperBroker:
     name = "paper"
     supports_broker_stops = False
+    # Splits are applied to the simulated position by the agent (apply_split).
+    adjusts_splits = False
     # No exchange calendar here: the agent confirms today is a trading day.
     needs_trading_day_check = True
 
@@ -146,20 +159,29 @@ class PaperBroker:
     async def ensure_protection(self, symbol: str, qty: float, stop: float) -> Dict[str, Any]:
         return {"action": "none", "reason": "paper broker: stops enforced by the agent"}
 
-    async def get_net_cash_flows(self, since) -> float:
-        return 0.0
+    async def get_cash_activities(self, since) -> List[Dict[str, Any]]:
+        return []
 
-    async def get_recent_fill(self, symbol: str, side: str, since) -> Optional[Dict[str, Any]]:
+    async def lookup_order(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        """Paper fills commit atomically with the order journal, so an order still
+        'pending' in the journal never executed (its transaction was rolled back)."""
+        return None
+
+    async def get_exit_fill(self, symbol: str, entry_order_id: Optional[str], since) -> Optional[Dict[str, Any]]:
         return None
 
 
 OPEN_STATES = {"new", "accepted", "pending_new", "accepted_for_bidding", "partially_filled", "held",
                "pending_replace", "replaced", "calculated", "done_for_day", "pending_cancel"}
+# A stop that is being cancelled no longer protects anything.
+PROTECTING_STATES = OPEN_STATES - {"pending_cancel"}
 DONE_STATES = {"filled", "canceled", "expired", "rejected", "suspended", "stopped"}
 
 
 class AlpacaBroker:
     supports_broker_stops = True
+    # Alpaca rescales positions for splits itself; the agent follows the position.
+    adjusts_splits = True
 
     def __init__(self, api_key: str, api_secret: str, live: bool, transport: Optional[httpx.AsyncBaseTransport] = None,
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep, fill_timeout: float = 15.0,
@@ -218,17 +240,22 @@ class AlpacaBroker:
         self._clock = (time.monotonic(), is_open)
         return is_open
 
-    async def get_net_cash_flows(self, since) -> float:
-        """Deposits minus withdrawals since `since` (so they don't look like P&L)."""
-        params = {"activity_types": "CSD,CSW", "after": since.isoformat()} if since else {"activity_types": "CSD,CSW"}
+    async def get_cash_activities(self, since) -> List[Dict[str, Any]]:
+        """Deposits (+) and withdrawals (−) since `since`, each with its activity id so
+        the agent can de-duplicate overlapping windows. Raises if Alpaca can't answer —
+        an unknown cash flow must not be mistaken for P&L."""
+        params = {"activity_types": "CSD,CSW", "direction": "asc", "page_size": "100"}
+        if since:
+            params["after"] = since.isoformat()
         resp = await self._req("GET", "/v2/account/activities", params=params)
-        if resp.status_code >= 400:
-            return 0.0
-        total = 0.0
+        resp.raise_for_status()
+        out = []
         for act in resp.json():
             amt = abs(float(act.get("net_amount") or 0))
-            total += amt if act.get("activity_type") == "CSD" else -amt
-        return total
+            key = act.get("id") or f"{act.get('activity_type')}:{act.get('date')}:{act.get('net_amount')}"
+            out.append({"id": str(key), "amount": amt if act.get("activity_type") == "CSD" else -amt,
+                        "date": act.get("date") or act.get("transaction_time")})
+        return out
 
     # ── Orders ──
 
@@ -292,6 +319,11 @@ class AlpacaBroker:
         # Not (fully) filled in time: cancel the remainder rather than leave an unknown order working.
         await self._req("DELETE", f"/v2/orders/{oid}")
         final = await self._wait(oid, timeout=5)
+        if final is None or final.get("status") not in DONE_STATES:
+            # The cancel is not confirmed (or the order can't be read): it may still fill.
+            # 'pending' keeps it in the journal; the next cycle resolves it by client_order_id.
+            return OrderResult(status="pending", broker_order_id=oid,
+                               message=f"Entry outcome unknown (status {(final or {}).get('status')}); will reconcile")
         filled_qty, px = self._filled(final)
         if filled_qty > 0:
             return OrderResult(status="partial", qty=filled_qty, fill_price=px, broker_order_id=oid,
@@ -322,7 +354,7 @@ class AlpacaBroker:
         held = await self._position_qty(symbol)
         if held <= 0:
             # A stop/target leg filled while we were cancelling: the position is already closed.
-            fill = await self.get_recent_fill(symbol, "sell", since=None)
+            fill = await self.get_recent_fill(symbol, "sell", since=utcnow() - timedelta(hours=1))
             return OrderResult(status="filled", qty=qty, fill_price=(fill or {}).get("price"),
                                message="Position already closed by a resting order", extra={"via": "bracket_leg"})
         sell_qty = min(qty, held)
@@ -337,11 +369,15 @@ class AlpacaBroker:
 
         # Exit failed: never leave the position naked — put a GTC stop back.
         message = resp.text[:200] if resp.status_code >= 400 else f"Exit not filled (status {(final or {}).get('status')})"
-        remaining = await self._position_qty(symbol)
         if final and final.get("id") and final.get("status") not in DONE_STATES:
             await self._req("DELETE", f"/v2/orders/{final['id']}")
-            await self._wait(final["id"], timeout=5)
-            remaining = await self._position_qty(symbol)
+            after_cancel = await self._wait(final["id"], timeout=5)
+            if after_cancel is not None:
+                final = after_cancel
+                filled_qty, px = self._filled(final)
+                if final.get("status") == "filled":    # the fill won the race against our cancel
+                    return OrderResult(status="filled", qty=filled_qty, fill_price=px, broker_order_id=final.get("id"))
+        remaining = await self._position_qty(symbol)
         reprotect = None
         if remaining > 0 and protective_stop:
             reprotect = await self.ensure_protection(symbol, remaining, protective_stop)
@@ -352,7 +388,8 @@ class AlpacaBroker:
     async def ensure_protection(self, symbol: str, qty: float, stop: float) -> Dict[str, Any]:
         """Make sure resting GTC sell-stop orders cover the whole position."""
         stops = [o for o in self._flatten_orders(await self._open_orders(symbol))
-                 if o.get("side") == "sell" and o.get("type") in ("stop", "stop_limit") and o.get("status") in OPEN_STATES]
+                 if o.get("side") == "sell" and o.get("type") in ("stop", "stop_limit")
+                 and o.get("status") in PROTECTING_STATES]
         covered = sum(float(o.get("qty") or 0) for o in stops)
         missing = int(qty - covered)
         if missing <= 0:
@@ -369,24 +406,67 @@ class AlpacaBroker:
         """Raise broker-side stops to the bot's trailing stop. Returns False if any update failed."""
         ok = True
         for leg in self._flatten_orders(await self._open_orders(symbol)):
-            if leg.get("side") == "sell" and leg.get("type") in ("stop", "stop_limit") and leg.get("status") in OPEN_STATES:
+            if leg.get("side") == "sell" and leg.get("type") in ("stop", "stop_limit") \
+                    and leg.get("status") in PROTECTING_STATES:
                 if stop > float(leg.get("stop_price") or 0) + 0.005:
                     resp = await self._req("PATCH", f"/v2/orders/{leg['id']}", json={"stop_price": f"{stop:.2f}"})
                     ok = ok and resp.status_code < 400
         return ok
 
     async def get_recent_fill(self, symbol: str, side: str, since) -> Optional[Dict[str, Any]]:
-        params = {"status": "closed", "symbols": symbol, "nested": "true", "direction": "desc", "limit": "20"}
+        """Most recent filled `side` order (or bracket leg) on `symbol` that FILLED after `since`.
+        Alpaca's `after` filter is on submission time and bracket legs are nested under a
+        parent submitted before the position opened, so the query window starts earlier
+        and the fill time is checked here."""
+        params = {"status": "closed", "symbols": symbol, "nested": "true", "direction": "desc", "limit": "50"}
         if since:
-            params["after"] = since.isoformat()
+            params["after"] = (since - timedelta(days=7)).isoformat()
         resp = await self._req("GET", "/v2/orders", params=params)
         if resp.status_code >= 400:
             return None
+        fills = []
         for o in self._flatten_orders(resp.json()):
-            if o.get("side") == side and o.get("status") == "filled" and o.get("filled_avg_price"):
-                return {"price": float(o["filled_avg_price"]), "qty": float(o.get("filled_qty") or 0),
-                        "filled_at": o.get("filled_at"), "order_id": o.get("id")}
-        return None
+            if o.get("side") != side or float(o.get("filled_qty") or 0) <= 0 or not o.get("filled_avg_price"):
+                continue
+            filled_at = _parse_ts(o.get("filled_at"))
+            if since and filled_at is not None and filled_at < since:
+                continue
+            fills.append((filled_at or since, o))
+        if not fills:
+            return None
+        _, o = max(fills, key=lambda t: t[0] or datetime.min.replace(tzinfo=timezone.utc))
+        return {"price": float(o["filled_avg_price"]), "qty": float(o.get("filled_qty") or 0),
+                "filled_at": o.get("filled_at"), "order_id": o.get("id")}
+
+    async def get_exit_fill(self, symbol: str, entry_order_id: Optional[str], since) -> Optional[Dict[str, Any]]:
+        """Where a position closed outside the bot: the filled bracket legs of its entry
+        order (quantity-weighted), else the latest sell fill after `since`."""
+        if entry_order_id:
+            parent = await self._get_order(entry_order_id)
+            legs = [leg for leg in (parent or {}).get("legs") or []
+                    if leg.get("side") == "sell" and float(leg.get("filled_qty") or 0) > 0 and leg.get("filled_avg_price")]
+            if legs:
+                qty = sum(float(leg["filled_qty"]) for leg in legs)
+                px = sum(float(leg["filled_qty"]) * float(leg["filled_avg_price"]) for leg in legs) / qty
+                return {"price": px, "qty": qty, "filled_at": max(str(leg.get("filled_at") or "") for leg in legs),
+                        "order_id": legs[0].get("id"), "via": "bracket_leg"}
+        return await self.get_recent_fill(symbol, "sell", since)
+
+    async def lookup_order(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve an order whose outcome the journal doesn't know. Cancels it if it is
+        still working (the bot never leaves entries resting). None = never reached Alpaca."""
+        resp = await self._req("GET", "/v2/orders:by_client_order_id",
+                               params={"client_order_id": client_order_id, "nested": "true"})
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        order = resp.json()
+        if order.get("status") not in DONE_STATES:
+            await self._req("DELETE", f"/v2/orders/{order['id']}")
+            order = await self._wait(order["id"], timeout=5) or order
+        filled_qty, px = self._filled(order)
+        return {"status": order.get("status"), "done": order.get("status") in DONE_STATES,
+                "filled_qty": filled_qty, "fill_price": px, "order_id": order.get("id")}
 
     async def apply_split(self, symbol: str, ratio: float) -> None:
         """Alpaca adjusts quantities and prices for splits itself."""

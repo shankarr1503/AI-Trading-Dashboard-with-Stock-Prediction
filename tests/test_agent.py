@@ -2,6 +2,7 @@
 including regression tests for every confirmed finding of the readiness audit."""
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
 import pytest
 from sqlalchemy import select, update
 
@@ -163,10 +164,11 @@ async def test_flatten_request_mid_cycle_blocks_remaining_entries(db_tables, mar
             return await super().buy(symbol, *a, **kw)
 
     agent = agent_for(market, factory=lambda db: AdminPanics(db, 100_000))
-    await agent.run_cycle(force=True)
+    summary = await agent.run_cycle(force=True)
     assert len(sent) == 1
-    summary = await agent_for(market).run_cycle()          # next cycle executes the flatten
-    assert summary["exits"] and await rows(BotPosition) == []
+    # The running cycle flattens what it holds before releasing the lease.
+    assert summary["status"] == "halted" and summary["exits"]
+    assert await rows(BotPosition) == [] and await rows(PaperPosition) == []
     assert not (await rows(BotState))[0].flatten_requested
 
 
@@ -302,8 +304,8 @@ async def test_cash_withdrawal_is_not_a_drawdown(db_tables, market):
     flows = {"value": 0.0}
 
     class WithFlows(AlwaysOpenPaperBroker):
-        async def get_net_cash_flows(self, since):
-            return flows["value"]
+        async def get_cash_activities(self, since):
+            return [{"id": "w1", "amount": flows["value"]}] if flows["value"] else []
 
         async def get_account(self, prices):
             acct = await super().get_account(prices)
@@ -326,3 +328,166 @@ def test_completed_bars_drops_todays_partial_bar():
     assert len(completed_bars(df, "AAA", now)) == len(df) - 1
     later = now + timedelta(days=1)
     assert len(completed_bars(df, "AAA", later)) == len(df)
+
+
+# ─── Verification-round regressions ──────────────────────────────────────────
+
+def _ny_today_frame(df):
+    """Shift a frame so its last bar is dated today in New York (a live trading day)."""
+    df = df.copy()
+    from zoneinfo import ZoneInfo
+
+    today = datetime.now(ZoneInfo("America/New_York")).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    df.index = pd.date_range(end=today, periods=len(df), freq="D").tz_localize("America/New_York").tz_convert("UTC")
+    return df
+
+
+async def test_stale_split_cache_on_ex_date_does_not_trip_kill_switch(db_tables, market):
+    agent = agent_for(market)
+    await agent.run_cycle(force=True)
+    pos = max(await rows(BotPosition), key=lambda p: p.qty * p.entry_price)
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+    market.stale_splits[pos.symbol] = []                       # the 12h-cached list predates the split
+    market.splits[pos.symbol] = [{"date": tomorrow, "ratio": 4.0}]
+    adjusted = market.frames[pos.symbol].copy()
+    adjusted[["open", "high", "low", "close"]] /= 4
+    market.frames[pos.symbol] = adjusted
+    market.price_override[pos.symbol] = float(adjusted["close"].iloc[-1])
+    summary = await agent.run_cycle(force=True)
+    assert (pos.symbol, True) in market.split_calls            # the jump forced a fresh split lookup
+    state = (await rows(BotState))[0]
+    assert not state.halted and summary["exits"] == []
+    after = [p for p in await rows(BotPosition) if p.symbol == pos.symbol][0]
+    assert after.qty == pytest.approx(pos.qty * 4)
+
+
+async def test_bad_tick_cannot_trip_the_kill_switch_or_fill_paper(db_tables, market):
+    agent = agent_for(market)
+    await agent.run_cycle(force=True)
+    pos = max(await rows(BotPosition), key=lambda p: p.qty * p.entry_price)
+    hwm = (await rows(BotState))[0].high_water_mark
+    market.price_override[pos.symbol] = pos.entry_price * 0.02      # one garbage print
+    summary = await agent.run_cycle(force=True)
+    assert summary["status"] == "degraded" and pos.symbol in summary["data_faults"]
+    assert not (await rows(BotState))[0].halted and summary["exits"] == []
+    market.price_override.pop(pos.symbol)
+    market.price_override[pos.symbol] = pos.entry_price * 3          # and an upward one
+    await agent.run_cycle(force=True)
+    assert (await rows(BotState))[0].high_water_mark == pytest.approx(hwm, rel=0.02)
+    market.price_override.pop(pos.symbol)
+    summary = await agent.run_cycle(force=True)
+    assert summary["status"] != "degraded" and not (await rows(BotState))[0].halted
+    assert pos.symbol in {p.symbol for p in await rows(PaperPosition)}
+
+
+async def test_trading_day_comes_from_reference_instruments(db_tables, market):
+    agent = agent_for(market)
+    assert not await agent._is_trading_day("AAA")                   # no reference data: assume closed
+    market.frames["SPY"] = _ny_today_frame(make_ohlcv(9, n=30))
+    assert await agent._is_trading_day("AAA")                       # AAA's own last bar is old (halted, mistyped…)
+
+
+async def test_cash_activity_is_counted_once_across_overlapping_windows(db_tables, market):
+    class WithDeposit(AlwaysOpenPaperBroker):
+        async def get_cash_activities(self, since):
+            return [{"id": "dep-1", "amount": 15_000.0}]
+
+    agent = agent_for(market, factory=lambda db: WithDeposit(db, 100_000))
+    await agent.run_cycle(force=True)                               # first check: baseline only
+    await set_state(cashflow_seen={})                               # the deposit lands after the baseline
+    await agent.run_cycle(force=True)
+    hwm_after_first = (await rows(BotState))[0].high_water_mark
+    await agent.run_cycle(force=True)                               # same activity returned again
+    assert (await rows(BotState))[0].high_water_mark == pytest.approx(hwm_after_first, rel=1e-6)
+    assert len([d for d in await rows(BotDecision) if d.action == "CASHFLOW"]) == 1
+
+
+async def test_unreadable_cash_flows_freeze_breakers(db_tables, market):
+    class Broken(AlwaysOpenPaperBroker):
+        async def get_cash_activities(self, since):
+            raise RuntimeError("activities endpoint down")
+
+    agent = agent_for(market, factory=lambda db: Broken(db, 100_000))
+    await agent.run_cycle(force=True)
+    await set_state(high_water_mark=200_000)                        # would be a kill-switch drawdown
+    summary = await agent.run_cycle(force=True)
+    assert summary["status"] == "degraded" and "cashflow_error" in summary
+    assert not (await rows(BotState))[0].halted
+
+
+async def test_kill_switch_pauses_the_bot_until_restarted(db_tables, market):
+    agent = agent_for(market)
+    await set_state(enabled=True)
+    await agent.run_cycle()
+    await set_state(high_water_mark=200_000)
+    await agent.run_cycle()
+    state = (await rows(BotState))[0]
+    assert state.halted and not state.enabled
+
+
+async def test_no_same_day_reentry_after_a_target_exit(db_tables, market):
+    agent = agent_for(market)
+    await agent.run_cycle(force=True)
+    pos = (await rows(BotPosition))[0]
+    market.price_override[pos.symbol] = pos.target_price * 1.001
+    summary = await agent.run_cycle(force=True)
+    assert any(e["symbol"] == pos.symbol and e["reason"] == "target" for e in summary["exits"])
+    market.price_override.pop(pos.symbol)
+    summary = await agent.run_cycle(force=True)
+    assert pos.symbol not in {e["symbol"] for e in summary["entries"]}
+    assert any(d.symbol == pos.symbol and "earlier today" in " ".join(d.reasons or []) for d in await rows(BotDecision))
+
+
+async def test_invalid_stored_overrides_still_enforce_stops(db_tables, market):
+    agent = agent_for(market)
+    await agent.run_cycle(force=True)
+    pos = (await rows(BotPosition))[0]
+    await set_state(config_overrides={"risk": {"max_risk_per_trade_pct": 0.5}})   # outside BOUNDS
+    market.price_override[pos.symbol] = pos.stop_price * 0.999
+    summary = await agent.run_cycle(force=True)
+    assert summary["status"] != "error" and "config_error" in summary
+    assert any(e["symbol"] == pos.symbol and e["reason"] == "stop" for e in summary["exits"])
+    assert summary["entries"] == []
+
+
+async def test_earnings_blackout_covers_unconfirmed_window_and_unknown_dates(db_tables, market):
+    today = datetime.now(timezone.utc).date()
+    research = FakeResearch({
+        "AAA": {"available": True, "piotroski": 6, "next_earnings": (today - timedelta(days=1)).isoformat(),
+                "next_earnings_end": (today + timedelta(days=4)).isoformat()},
+        "BBB": {"available": True, "piotroski": 6, "earnings_unknown": True},
+    })
+    summary = await agent_for(market, research=research).run_cycle(force=True)
+    assert not {"AAA", "BBB"} & {e["symbol"] for e in summary["entries"]}
+    text = " ".join(" ".join(d.reasons or []) for d in await rows(BotDecision))
+    assert "gap-risk blackout" in text and "Earnings date unknown" in text
+
+
+async def test_slow_llm_review_times_out_to_the_fail_safe(db_tables, market, monkeypatch):
+    import asyncio
+
+    import backend.trading.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "REVIEW_TIMEOUT_SECONDS", 0.05)
+
+    class Slow:
+        async def review(self, proposal, handler):
+            await asyncio.sleep(5)
+            return Verdict("approve", 1.0, "too late")
+
+        def _fail_safe(self, why):
+            return Verdict("veto", 0.0, why, source="fail_safe")
+
+    summary = await agent_for(market, reviewer=Slow()).run_cycle(force=True)
+    assert summary["status"] == "ok" and summary["entries"] == []
+
+
+async def test_panic_during_review_sends_no_order(db_tables, market):
+    class PanicWhileThinking:
+        async def review(self, proposal, handler):
+            await set_state(flatten_requested=True, halted=True, halt_reason="FLATTEN: test", enabled=False)
+            return Verdict("approve", 1.0, "looks fine")
+
+    summary = await agent_for(market, reviewer=PanicWhileThinking()).run_cycle(force=True)
+    assert summary["entries"] == [] and not [o for o in await rows(BotOrder) if o.side == "BUY"]
+    assert not (await rows(BotState))[0].flatten_requested           # nothing held: flatten complete

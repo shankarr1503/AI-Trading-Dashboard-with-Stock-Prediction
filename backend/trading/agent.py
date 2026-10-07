@@ -7,19 +7,26 @@ Safety properties (each one exists because an audit found it missing):
   lease is renewed — and ownership re-checked — before every broker action,
   so a cycle that lost its lease stops before it can place another order.
 * Durable side effects. Each order is journaled as `pending` before it is
-  sent and committed immediately after, and every position/candidate is
-  processed in isolation, so a later error can never roll back an exit or
-  hide an order that reached the broker.
-* Fail safe on bad data. A held position without a price is a data fault:
-  the high-water mark, daily baseline and circuit breakers are frozen, no new
-  entries are taken, and the operator is alerted. Splits rescale the bot's
-  stops instead of looking like a crash; unexplained >30% gaps need a second
-  observation before they trigger exits.
+  sent; its outcome and the resulting position or trade are committed
+  together, and every position/candidate is processed in isolation. An order
+  whose outcome was lost (timeout, crash, unconfirmed cancel) stays `pending`
+  and is resolved against the broker at the start of the next cycle, so a
+  fill becomes a managed position instead of an orphan.
+* Fail safe on bad data. A held position without a trustworthy price is a
+  data fault: the high-water mark, daily baseline and circuit breakers are
+  frozen, no new entries are taken, and the operator is alerted. A price more
+  than 30% away from the last accepted mark is not trusted until it is
+  explained by a split (re-checked against a fresh split feed, and at a broker
+  that adjusts splits itself, against the position) or confirmed by a second
+  observation, so neither a split nor a bad tick can move equity, trip the
+  kill switch or trigger an exit.
 * Live = backtested. Entries, exits and edge calibration use the technical
   score on completed daily bars, exactly as in the backtest. ML, sentiment,
   fundamentals and the earnings calendar can only block or shrink a trade.
-* Panic button. /flatten sets a durable flag and halt; whichever process
-  holds the lease closes everything, and in-flight cycles stop opening trades.
+* Panic button. /flatten sets a durable flag and halt. Every entry is fenced
+  atomically against that flag right before it is sent; a cycle that is
+  already running flattens before it releases the lease, otherwise whichever
+  process takes the lease next does.
 """
 from __future__ import annotations
 
@@ -28,7 +35,7 @@ import logging
 import math
 import uuid
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from sqlalchemy import delete, or_, select, update
@@ -46,7 +53,7 @@ from backend.trading.broker import BrokerPosition, OrderResult, make_broker
 from backend.trading.calibration import Calibrator
 from backend.trading.costs import cost_model_for
 from backend.trading.llm_reviewer import LLMReviewer, Verdict
-from backend.trading.markets import IN_TZ, US_TZ, exchange_for, trading_date
+from backend.trading.markets import REFERENCE_SYMBOLS, exchange_for, exchange_tz, trading_date
 from backend.trading.regime import Regime
 from backend.trading.risk import PortfolioSnapshot, RiskConfig, RiskManager, TradeProposal
 from backend.trading.strategy import (
@@ -60,8 +67,11 @@ DECISION_RETENTION_DAYS = 30
 POOLED_KEY = "__POOLED__"
 OOS_KEY = "__OOS__"
 MIN_OOS_TRADES = 30
-SUSPICIOUS_MOVE = 0.30
+SUSPICIOUS_MOVE = 0.30        # unexplained move vs the last accepted mark → needs a second observation
+SPLIT_RECHECK_MOVE = 0.10     # beyond this (or at the stop) the split feed is re-read, bypassing its cache
 REQUOTE_TOLERANCE = 0.005
+REVIEW_TIMEOUT_SECONDS = 90.0  # a slow LLM review must not delay the panic button or the cycle
+CASHFLOW_LOOKBACK = timedelta(days=3)
 STOP_EXIT_REASONS = ("stop", "stop_gap", "kill_switch", "broker_exit")
 
 
@@ -79,9 +89,23 @@ async def get_state(db: AsyncSession) -> BotState:
     return state
 
 
+def config_error(state: BotState) -> Optional[str]:
+    try:
+        RiskConfig().with_overrides((state.config_overrides or {}).get("risk"))
+        return None
+    except (TypeError, ValueError) as e:
+        return str(e)
+
+
 def effective_configs(state: BotState) -> tuple[StrategyConfig, RiskConfig, List[str]]:
     overrides = state.config_overrides or {}
-    risk_cfg = RiskConfig().with_overrides(overrides.get("risk"))
+    try:
+        risk_cfg = RiskConfig().with_overrides(overrides.get("risk"))
+    except (TypeError, ValueError) as e:
+        # A bad stored override must never stop the bot from enforcing stops:
+        # fall back to defaults (entries are blocked until it is fixed).
+        logger.error("Invalid stored risk overrides (%s); using defaults", e)
+        risk_cfg = RiskConfig()
     universe = list(dict.fromkeys(overrides.get("universe") or settings.bot_universe))
     return StrategyConfig(), risk_cfg, universe
 
@@ -98,18 +122,27 @@ async def load_oos(db: AsyncSession) -> Optional[Dict[str, Any]]:
 
 
 def exchange_today(symbol: str, now: datetime) -> date:
-    tz = IN_TZ if exchange_for(symbol) == "NSE" else US_TZ
-    return now.astimezone(tz).date()
+    return now.astimezone(exchange_tz(symbol)).date()
+
+
+def _last_bar_day(df: pd.DataFrame, symbol: str) -> Optional[date]:
+    if df.empty:
+        return None
+    idx = df.index if df.index.tz is not None else df.index.tz_localize("UTC")
+    return idx[-1].tz_convert(exchange_tz(symbol)).date()
 
 
 def completed_bars(df: pd.DataFrame, symbol: str, now: datetime) -> pd.DataFrame:
     """Drop today's still-forming daily bar so live signals match the backtest."""
     if df.empty:
         return df
-    tz = IN_TZ if exchange_for(symbol) == "NSE" else US_TZ
-    idx = df.index if df.index.tz is not None else df.index.tz_localize("UTC")
-    last_day = idx[-1].tz_convert(tz).date()
-    return df.iloc[:-1] if last_day >= exchange_today(symbol, now) else df
+    return df.iloc[:-1] if _last_bar_day(df, symbol) >= exchange_today(symbol, now) else df
+
+
+def _coid(cycle_id: str, symbol: str, side: str) -> str:
+    """A client_order_id unique per attempt: Alpaca rejects a reused id forever, so a
+    retried exit (e.g. a second flatten of the same symbol) must never repeat one."""
+    return f"bot-{cycle_id}-{uuid.uuid4().hex[:8]}-{side}-{symbol}"[:64]
 
 
 class TradingAgent:
@@ -191,18 +224,29 @@ class TradingAgent:
             return cache[ex]
         is_open = await broker.is_market_open(symbol)
         if is_open and getattr(broker, "needs_trading_day_check", False):
-            # Paper mode has no exchange calendar: confirm today is a trading day
-            # (Yahoo only shows a bar for today once the exchange has traded).
-            try:
-                df = await self.market.get_history_df(symbol, period="5d", interval="1d")
-                tz = IN_TZ if ex == "NSE" else US_TZ
-                idx = df.index if df.index.tz is not None else df.index.tz_localize("UTC")
-                is_open = idx[-1].tz_convert(tz).date() == exchange_today(symbol, self.now())
-            except Exception as e:
-                logger.info("Trading-day check failed for %s (%s); assuming closed", symbol, e)
-                is_open = False
+            is_open = await self._is_trading_day(symbol)
         cache[ex] = is_open
         return is_open
+
+    async def _is_trading_day(self, symbol: str) -> bool:
+        """
+        Paper mode has no exchange calendar. Yahoo shows a bar for today once the
+        exchange has traded, so today is a trading day if any liquid reference
+        instrument (or the symbol itself) has one — one halted, delisted or
+        mistyped universe symbol can't switch off stop enforcement for everything.
+        """
+        today = exchange_today(symbol, self.now())
+        errors = []
+        for ref in dict.fromkeys(REFERENCE_SYMBOLS.get(exchange_for(symbol), ()) + (symbol,)):
+            try:
+                df = await self.market.get_history_df(ref, period="5d", interval="1d")
+                if _last_bar_day(df, ref) == today:
+                    return True
+            except Exception as e:
+                errors.append(f"{ref}: {e}")
+        if errors:
+            logger.info("Trading-day check for %s: no bar today (%s)", exchange_for(symbol), "; ".join(errors))
+        return False
 
     # ─── Public API ───────────────────────────────────────────────────────────
 
@@ -261,8 +305,10 @@ class TradingAgent:
     async def flatten_all(self, reason: str, wait_seconds: float = 60.0) -> Dict[str, Any]:
         """
         Panic button. Durably halts the bot and requests a flatten, then tries
-        to perform it under the lease. In-flight cycles re-check the flag before
-        every entry, so nothing new is opened once this returns.
+        to perform it under the lease. A running cycle fences every entry
+        against the flag atomically and flattens before it releases the lease,
+        so if this returns 'queued' the flatten still happens at the end of
+        that cycle (or, for closed markets, at the next open).
         """
         async with self.session_factory() as db:
             state = await get_state(db)
@@ -280,17 +326,27 @@ class TradingAgent:
                 if await self._acquire_lease(db, token):
                     break
             if asyncio.get_running_loop().time() >= deadline:
-                return {"status": "queued", "message": "A cycle holds the lease; it will flatten when it finishes."}
+                return {"status": "queued",
+                        "message": "A cycle holds the lease; it opens nothing new and flattens before it finishes."}
             await asyncio.sleep(1.0)
         try:
             async with self.session_factory() as db:
                 broker = self.broker_factory(db)
                 try:
+                    # Orders whose outcome was lost may have opened positions: resolve them first.
+                    await self._resolve_pending_orders(db, broker, token, "flatten")
                     results = await self._flatten(db, broker, token, "manual_flatten", {})
+                    state = await get_state(db)
+                    await db.refresh(state)
+                    done = not state.flatten_requested
                 finally:
                     if hasattr(broker, "aclose"):
                         await broker.aclose()
-            return {"status": "done", "closed": results}
+            if done:
+                return {"status": "done", "closed": results}
+            return {"status": "pending", "closed": results,
+                    "message": "Some positions could not be closed yet (market closed, no trustworthy price or a "
+                               "broker error); every cycle retries until they are."}
         finally:
             await self._release_lease(token)
 
@@ -300,7 +356,9 @@ class TradingAgent:
         async with self.session_factory() as db:
             broker = self.broker_factory(db)
             try:
-                return await self._cycle_inner(db, broker, cycle_id, token, allow_entries, force)
+                summary = await self._cycle_inner(db, broker, cycle_id, token, allow_entries, force)
+                await self._late_flatten(db, broker, token, summary)
+                return summary
             finally:
                 if hasattr(broker, "aclose"):
                     await broker.aclose()
@@ -315,10 +373,16 @@ class TradingAgent:
                            force: bool = False) -> Dict[str, Any]:
         state = await get_state(db)
         scfg, rcfg, universe = effective_configs(state)
+        cfg_err = config_error(state)
         risk = RiskManager(rcfg)
         now = self.now()
         summary: Dict[str, Any] = {"cycle_id": cycle_id, "status": "ok", "mode": getattr(broker, "name", "?"),
                                    "entries": [], "exits": [], "skipped": 0, "data_faults": []}
+        if cfg_err:
+            summary["config_error"] = cfg_err
+
+        # ── Orders whose outcome was lost become positions (or are closed out) first ──
+        await self._resolve_pending_orders(db, broker, token, cycle_id)
 
         # ── Observe ──
         broker_positions = {p.symbol: p for p in await broker.get_positions()}
@@ -330,37 +394,43 @@ class TradingAgent:
         for sym, bp in broker_positions.items():
             if sym not in prices and bp.market_price:
                 prices[sym] = bp.market_price   # broker's own mark as fallback
-        missing = sorted(s for s in broker_positions if s not in prices)
 
-        if await self._apply_splits(db, broker, broker_positions, tracked, cycle_id):
+        # Splits and implausible prices are dealt with before anything is valued.
+        if await self._check_prices(db, broker, broker_positions, tracked, prices, cycle_id):
             broker_positions = {p.symbol: p for p in await broker.get_positions()}   # post-split quantities
+        missing = sorted(s for s in broker_positions if s not in prices)
         await self._reconcile(db, broker, broker_positions, tracked, prices, cycle_id, now)
         tracked = {p.symbol: p for p in (await db.execute(select(BotPosition))).scalars()}
 
         # ── Equity, cash flows, breakers ──
         account = await broker.get_account(prices)
-        data_fault = bool(missing)
         mv = {s: p.qty * prices.get(s, p.avg_price) for s, p in broker_positions.items()}
+        cash_err = None
+        if not missing:
+            try:
+                await self._apply_cash_flows(db, broker, state, account.equity, cycle_id, now)
+            except Exception as e:
+                logger.warning("Cash-flow check failed: %s", e)
+                cash_err = f"{type(e).__name__}: {e}"
+        data_fault = bool(missing) or cash_err is not None
         if data_fault:
             state.consecutive_data_faults = (state.consecutive_data_faults or 0) + 1
             summary["status"] = "degraded"
             summary["data_faults"] = missing
+            why = []
+            if missing:
+                why.append(f"No trustworthy price for held position(s): {', '.join(missing)}.")
+            if cash_err:
+                summary["cashflow_error"] = cash_err
+                why.append(f"Deposits/withdrawals could not be read ({cash_err}), so equity changes can't be attributed.")
             db.add(BotDecision(cycle_id=cycle_id, action="DATA_FAULT",
-                               reasons=[f"No price for held position(s): {', '.join(missing)}. Equity, high-water mark "
-                                        "and circuit breakers frozen; no new entries this cycle."]))
+                               reasons=why + ["Equity, high-water mark and circuit breakers frozen; no new entries "
+                                              "this cycle."]))
             if state.consecutive_data_faults >= 2:
-                await notify("data_fault", f"No prices for {', '.join(missing)} for {state.consecutive_data_faults} cycles",
+                await notify("data_fault", f"{' '.join(why)} ({state.consecutive_data_faults} cycles)",
                              "critical" if not getattr(broker, "supports_broker_stops", False) else "warning")
         else:
             state.consecutive_data_faults = 0
-            flows = await broker.get_net_cash_flows(state.cashflow_checked_at) if state.cashflow_checked_at else 0.0
-            state.cashflow_checked_at = now
-            if flows:
-                # Deposits/withdrawals are not performance.
-                state.high_water_mark = float(state.high_water_mark or account.equity) + flows
-                if state.day_start_equity is not None:
-                    state.day_start_equity = float(state.day_start_equity) + flows
-                db.add(BotDecision(cycle_id=cycle_id, action="CASHFLOW", reasons=[f"Net external cash flow {flows:+,.2f}"]))
             today = trading_date(now)
             if state.day_start_date != today:
                 state.day_start_date = today
@@ -386,6 +456,7 @@ class TradingAgent:
 
         if breakers and breakers.kill and not state.halted:
             state.halted, state.halted_at = True, now
+            state.enabled = False   # after /reset-halt the operator restarts explicitly
             state.halt_reason = "; ".join(breakers.reasons)
             state.flatten_requested = bool(rcfg.flatten_on_kill)
             db.add(BotDecision(cycle_id=cycle_id, action="HALT", reasons=breakers.reasons))
@@ -396,11 +467,11 @@ class TradingAgent:
         is_open = {s: await self._market_open(broker, s, open_cache) for s in symbols}
         summary["market_open"] = open_cache
 
-        # ── Flatten (kill switch or panic button) ──
+        # ── Flatten (kill switch or panic button — possibly pressed while we were observing) ──
+        await db.refresh(state)
         if state.flatten_requested:
-            summary["exits"].extend(await self._flatten(db, broker, token, "kill_switch" if state.halt_reason
-                                                         and state.halt_reason.startswith("KILL") else "manual_flatten",
-                                                         is_open, prices))
+            summary["_flattened"] = True
+            summary["exits"].extend(await self._flatten(db, broker, token, self._flatten_reason(state), is_open, prices))
             broker_positions = {p.symbol: p for p in await broker.get_positions()}
             for s in list(mv):
                 if s not in broker_positions:
@@ -434,7 +505,7 @@ class TradingAgent:
 
         # ── Entries ──
         await db.refresh(state)
-        blocked = self._entry_blockers(state, allow_entries, force, data_fault, breakers, now)
+        blocked = self._entry_blockers(state, allow_entries, force, data_fault, breakers, now, cfg_err)
         if not blocked:
             blocked = await self._broker_calibration_blocker(db, broker)
         if blocked:
@@ -451,25 +522,41 @@ class TradingAgent:
             day_start_equity=float(state.day_start_equity or account.equity),
             consecutive_losses=state.consecutive_losses or 0, cooldown_active=False,
         )
-        recently_stopped = await self._recently_stopped(db, rcfg, now)
+        reentry_blocked = await self._reentry_blocks(db, rcfg, now)
         tradeable = [s for s in universe if is_open.get(s) and s in prices and s not in broker_positions
-                     and s not in exited and s not in recently_stopped]
+                     and s not in exited and s not in reentry_blocked]
         for s in universe:
-            if s in recently_stopped and s not in broker_positions:
-                db.add(BotDecision(cycle_id=cycle_id, symbol=s, action="SKIP",
-                                   reasons=[f"Re-entry cooldown after a stop-out ({rcfg.reentry_cooldown_hours:.0f}h)"]))
+            if s in reentry_blocked and s not in broker_positions:
+                db.add(BotDecision(cycle_id=cycle_id, symbol=s, action="SKIP", reasons=[reentry_blocked[s]]))
         candidates = await self._find_candidates(db, tradeable, prices, scfg, frames, cycle_id, summary, now)
         await self._execute_entries(db, broker, token, candidates, snap, risk, frames, prices, cycle_id, summary, force)
         await db.commit()
         return summary
 
-    def _entry_blockers(self, state: BotState, allow_entries: bool, force: bool, data_fault: bool, breakers, now):
+    @staticmethod
+    def _flatten_reason(state: BotState) -> str:
+        return "kill_switch" if (state.halt_reason or "").startswith("KILL") else "manual_flatten"
+
+    async def _late_flatten(self, db: AsyncSession, broker, token: str, summary: Dict[str, Any]) -> None:
+        """A panic pressed while this cycle was running is executed before the lease is released."""
+        flattened = summary.pop("_flattened", False)
+        state = await get_state(db)
+        await db.refresh(state)
+        if not state.flatten_requested or (flattened and not summary.get("entries")):
+            return
+        summary["exits"].extend(await self._flatten(db, broker, token, self._flatten_reason(state), {}))
+        summary["status"] = "halted"
+
+    def _entry_blockers(self, state: BotState, allow_entries: bool, force: bool, data_fault: bool, breakers, now,
+                        cfg_err: Optional[str] = None):
         if state.flatten_requested or state.halted:
             return ("halted", [state.halt_reason or "Bot is halted"])
         if not allow_entries or not (state.enabled or force):
             return ("paused", ["Bot is paused: protective management only"])
+        if cfg_err:
+            return ("entries_blocked", [f"Stored risk overrides are invalid ({cfg_err}); fix them via PUT /config"])
         if data_fault:
-            return ("degraded", ["Data fault: no new entries until every held position has a price"])
+            return ("degraded", ["Data fault: no new entries until every held position has a trustworthy price"])
         if breakers is not None and not breakers.allow_entries:
             return ("entries_blocked", breakers.reasons)
         if state.cooldown_until is not None and as_utc(state.cooldown_until) > now:
@@ -486,54 +573,235 @@ class TradingAgent:
                 "positive expectancy (run POST /api/bot/calibrate)."])
         return None
 
-    async def _recently_stopped(self, db: AsyncSession, rcfg: RiskConfig, now) -> Set[str]:
-        if rcfg.reentry_cooldown_hours <= 0:
-            return set()
-        since = now - timedelta(hours=rcfg.reentry_cooldown_hours)
-        rows = (await db.execute(select(BotTrade.symbol).where(
-            BotTrade.exit_time >= since, BotTrade.exit_reason.in_(STOP_EXIT_REASONS)))).scalars().all()
-        return set(rows)
+    async def _reentry_blocks(self, db: AsyncSession, rcfg: RiskConfig, now) -> Dict[str, str]:
+        """
+        Symbols that may not be bought now: stopped out within the cooldown, or
+        exited for any reason earlier today (the next entry signal would come from
+        the same completed bar that just closed the trade — the backtest can only
+        re-enter a bar later).
+        """
+        window = max(rcfg.reentry_cooldown_hours, 0.0) + 48
+        rows = (await db.execute(select(BotTrade.symbol, BotTrade.exit_time, BotTrade.exit_reason).where(
+            BotTrade.exit_time >= now - timedelta(hours=window)))).all()
+        out: Dict[str, str] = {}
+        cooldown = timedelta(hours=rcfg.reentry_cooldown_hours)
+        for sym, exit_time, reason in rows:
+            t = as_utc(exit_time)
+            if reason in STOP_EXIT_REASONS and rcfg.reentry_cooldown_hours > 0 and t >= now - cooldown:
+                out[sym] = f"Re-entry cooldown after a stop-out ({rcfg.reentry_cooldown_hours:.0f}h)"
+            elif exchange_today(sym, t) == exchange_today(sym, now):
+                out.setdefault(sym, "Exited earlier today: no re-entry on the same completed bar")
+        return out
 
     # ─── Corporate actions & reconciliation ───────────────────────────────────
 
-    async def _apply_splits(self, db, broker, broker_positions, tracked, cycle_id) -> bool:
-        """Rescale bot records for splits since entry. Returns True if anything changed."""
+    async def _fetch_splits(self, sym: str, fresh: bool) -> Optional[List[dict]]:
         get_splits = getattr(self.market, "get_splits", None)
         if get_splits is None:
-            return False
+            return []
+        try:
+            return await asyncio.wait_for(get_splits(sym, fresh=fresh), 15)
+        except Exception as e:
+            logger.info("Split feed unavailable for %s: %s", sym, e)
+            return None
+
+    @staticmethod
+    def _rescale(meta: BotPosition, r: float) -> None:
+        for f in ("entry_price", "stop_price", "initial_stop", "target_price", "highest_price", "entry_atr"):
+            v = getattr(meta, f)
+            if v is not None:
+                setattr(meta, f, float(v) / r)
+        meta.qty = float(meta.qty) * r
+        m = dict(meta.meta or {})
+        if m.get("last_mark"):
+            m["last_mark"] = float(m["last_mark"]) / r
+        m.pop("suspect_price", None)
+        meta.meta = m
+
+    async def _apply_feed_splits(self, db, broker, sym: str, meta: BotPosition, splits: List[dict], cycle_id) -> float:
+        """Rescale for splits since entry that the split feed reports (simulated broker). Returns the ratio."""
+        m = dict(meta.meta or {})
+        applied = set(m.get("applied_splits", []))
+        opened = pd.Timestamp(as_utc(meta.opened_at))
+        total = 1.0
+        for sp in splits:
+            key = f"{sp['date']}:{sp['ratio']}"
+            when = pd.Timestamp(sp["date"])
+            when = when.tz_localize("UTC") if when.tzinfo is None else when
+            if key in applied or when <= opened or not sp["ratio"] or sp["ratio"] <= 0:
+                continue
+            r = float(sp["ratio"])
+            self._rescale(meta, r)
+            await broker.apply_split(sym, r)
+            applied.add(key)
+            total *= r
+            meta.meta = {**(meta.meta or {}), "applied_splits": sorted(applied)}
+            db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="SPLIT",
+                               reasons=[f"Applied {r:g}-for-1 split dated {sp['date']}: rescaled stops and quantity"]))
+            await notify("split_applied", f"{sym}: applied {r:g}:1 split", "info")
+        return total
+
+    def _apply_broker_split(self, db, sym: str, meta: BotPosition, bp: BrokerPosition, cycle_id) -> float:
+        """
+        A broker that adjusts splits itself (Alpaca) shows one as quantity × r and
+        average price ÷ r. A partial exit changes only the quantity, so it can't
+        be mistaken for a split. Returns the ratio applied (1.0 if none).
+        """
+        held = float(meta.qty)
+        entry = float(meta.entry_price)
+        if held <= 0 or entry <= 0 or not bp.avg_price:
+            return 1.0
+        r = bp.qty / held
+        if abs(r - 1) < 0.2 or abs(bp.avg_price * r / entry - 1) > 0.05:
+            return 1.0
+        self._rescale(meta, r)
+        meta.entry_price = bp.avg_price
+        db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="SPLIT",
+                           reasons=[f"Broker adjusted the position for a {r:g}-for-1 split: rescaled stops and targets"]))
+        return r
+
+    async def _check_prices(self, db, broker, broker_positions: Dict[str, BrokerPosition], tracked, prices: Dict[str, float],
+                            cycle_id) -> bool:
+        """
+        Before anything is valued: explain or quarantine implausible prices of held
+        positions. A big move first re-reads the split feed without its cache (on
+        a split's ex-date the cached list is stale); an unexplained move of more
+        than SUSPICIOUS_MOVE is dropped from `prices` (→ data fault: equity, HWM
+        and breakers frozen, no action on it) until a second observation confirms
+        it. Returns True if a split changed quantities.
+        """
         changed = False
+        broker_adjusts = getattr(broker, "adjusts_splits", False)
         for sym, meta in tracked.items():
-            splits = await self._optional(get_splits(sym), timeout=15) or []
-            applied = set((meta.meta or {}).get("applied_splits", []))
-            opened = as_utc(meta.opened_at)
-            for sp in splits:
-                key = f"{sp['date']}:{sp['ratio']}"
-                when = pd.Timestamp(sp["date"])
-                when = when.tz_localize("UTC") if when.tzinfo is None else when
-                if key in applied or when <= pd.Timestamp(opened) or not sp["ratio"] or sp["ratio"] <= 0:
-                    continue
-                r = float(sp["ratio"])
-                for f in ("entry_price", "stop_price", "initial_stop", "target_price", "highest_price", "entry_atr"):
-                    v = getattr(meta, f)
-                    if v is not None:
-                        setattr(meta, f, float(v) / r)
-                meta.qty = float(meta.qty) * r
-                await broker.apply_split(sym, r)
-                applied.add(key)
-                changed = True
-                meta.meta = {**(meta.meta or {}), "applied_splits": sorted(applied)}
-                db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="SPLIT",
-                                   reasons=[f"Applied {r:g}-for-1 split dated {sp['date']}: rescaled stops and quantity"]))
-                await notify("split_applied", f"{sym}: applied {r:g}:1 split", "info")
+            bp = broker_positions.get(sym)
+            if bp is None:
+                continue
+            price = prices.get(sym)
+            m = dict(meta.meta or {})
+            ref = float(m.get("last_mark") or meta.highest_price or meta.entry_price)
+            jumped = price is not None and ref > 0 and (abs(price / ref - 1) > SPLIT_RECHECK_MOVE
+                                                        or price <= float(meta.stop_price))
+            if broker_adjusts:
+                ratio = self._apply_broker_split(db, sym, meta, bp, cycle_id)
+            else:
+                splits = await self._fetch_splits(sym, fresh=jumped)
+                ratio = await self._apply_feed_splits(db, broker, sym, meta, splits or [], cycle_id)
+                changed = changed or ratio != 1.0
+            if ratio != 1.0:
+                m = dict(meta.meta or {})
+                ref = float(m.get("last_mark") or meta.highest_price or meta.entry_price)
+            if price is None:
+                continue
+            move = price / ref - 1 if ref > 0 else 0.0
+            if abs(move) > SUSPICIOUS_MOVE:
+                suspect = m.get("suspect_price")
+                if suspect and abs(price / float(suspect) - 1) < 0.10:
+                    m.pop("suspect_price", None)
+                    m["last_mark"] = price
+                    db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="DATA_FAULT",
+                                       reasons=[f"Move to {price:.2f} ({move:+.0%} vs last mark {ref:.2f}) confirmed by a "
+                                                "second observation and no split explains it: acting on it"]))
+                else:
+                    m["suspect_price"] = price
+                    prices.pop(sym, None)
+                    db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="DATA_FAULT",
+                                       reasons=[f"Price {price:.2f} is {move:+.0%} vs last mark {ref:.2f} and no split "
+                                                "explains it: not trusted until a second observation confirms it"]))
+                    await notify("suspicious_move", f"{sym} quoted {move:+.0%} vs last mark; awaiting confirmation",
+                                 "warning")
+            else:
+                m.pop("suspect_price", None)
+                m["last_mark"] = price
+            meta.meta = m
         await db.commit()
         return changed
+
+    async def _apply_cash_flows(self, db, broker, state: BotState, equity: float, cycle_id, now) -> float:
+        """
+        Deposits and withdrawals are not performance: shift the high-water mark and
+        the daily baseline by them. Activities are read over a window that overlaps
+        the previous check and de-duplicated by id, so a flow posted while a cycle
+        is running is counted exactly once. Raises if the broker can't answer.
+        """
+        checked = as_utc(state.cashflow_checked_at) if state.cashflow_checked_at else None
+        since = (checked or now) - CASHFLOW_LOOKBACK
+        activities = await broker.get_cash_activities(since)
+        seen = dict(state.cashflow_seen or {})
+        new = [a for a in activities if str(a["id"]) not in seen]
+        for a in new:
+            seen[str(a["id"])] = now.isoformat()
+        # An id first seen before the window minus a day can no longer be returned again.
+        horizon = since - timedelta(days=1)
+        state.cashflow_seen = {k: v for k, v in seen.items() if datetime.fromisoformat(v) >= horizon}
+        state.cashflow_checked_at = now
+        if checked is None:
+            return 0.0   # first check: earlier flows are already part of the starting equity
+        flows = float(sum(float(a["amount"]) for a in new))
+        if flows:
+            state.high_water_mark = float(state.high_water_mark or equity) + flows
+            if state.day_start_equity is not None:
+                state.day_start_equity = float(state.day_start_equity) + flows
+            db.add(BotDecision(cycle_id=cycle_id, action="CASHFLOW", reasons=[f"Net external cash flow {flows:+,.2f}"]))
+        return flows
+
+    # ─── Orders with an unknown outcome ───────────────────────────────────────
+
+    async def _resolve_pending_orders(self, db, broker, token, cycle_id) -> None:
+        """
+        An order still 'pending' in the journal was sent but its outcome was never
+        recorded (timeout, crash, cancel not confirmed). Ask the broker what
+        happened: a filled entry becomes a managed position with the stop and
+        target it was sent with; a filled exit is booked by reconciliation.
+        """
+        pending = (await db.execute(select(BotOrder).where(BotOrder.status == "pending")
+                                    .order_by(BotOrder.id))).scalars().all()
+        for order in pending:
+            om = dict(order.meta or {})
+            coid = om.get("client_order_id") or order.broker_order_id
+            try:
+                await self._renew_lease(db, token)
+                info = await broker.lookup_order(coid) if coid else None
+            except LeaseLost:
+                raise
+            except Exception as e:
+                logger.warning("Could not resolve pending order %s: %s", coid, e)
+                continue   # still unknown: try again next cycle
+            if info is not None and not info.get("done"):
+                continue   # cancel not confirmed yet
+            filled = float((info or {}).get("filled_qty") or 0)
+            if filled <= 0:
+                order.status = "cancelled" if info is not None else "rejected"
+                order.meta = {**om, "resolved": "no fill at the broker"}
+                await db.commit()
+                continue
+            order.status = "filled" if info.get("status") == "filled" else "partial"
+            order.qty = filled
+            order.fill_price = info.get("fill_price") or order.ref_price
+            order.broker_order_id = info.get("order_id") or order.broker_order_id
+            order.meta = {**om, "recovered": True}
+            msg = f"{order.side} {filled:g} {order.symbol} @ {order.fill_price:.2f} filled after its confirmation was lost"
+            if order.side == "BUY":
+                if await db.get(BotPosition, order.symbol) is None:
+                    stop = float(om.get("stop") or order.fill_price * 0.95)
+                    db.add(BotPosition(
+                        symbol=order.symbol, qty=filled, entry_price=order.fill_price, stop_price=stop, initial_stop=stop,
+                        target_price=om.get("target"), highest_price=order.fill_price, entry_atr=om.get("atr"),
+                        entry_score=om.get("score"), entry_costs=order.commission or 0.0,
+                        opened_at=as_utc(order.created_at) or self.now(),
+                        meta={"recovered": True, "entry_order_id": order.broker_order_id, "regime": om.get("regime"),
+                              "cycle_id": om.get("cycle_id"), "last_mark": order.fill_price},
+                    ))
+                    msg += ": now managed with its original stop and target"
+            db.add(BotDecision(cycle_id=cycle_id, symbol=order.symbol, action="RECOVER", qty=filled, reasons=[msg]))
+            await db.commit()
+            await notify("order_recovered", msg, "warning")
 
     async def _reconcile(self, db, broker, broker_positions: Dict[str, BrokerPosition], tracked, prices, cycle_id, now) -> None:
         """Keep bot_positions consistent with what the broker actually holds."""
         for sym, meta in tracked.items():
             if sym not in broker_positions:
                 # Closed outside the bot (e.g. an Alpaca bracket leg filled between cycles).
-                fill = await broker.get_recent_fill(sym, "sell", as_utc(meta.opened_at))
+                fill = await self._exit_fill(db, broker, meta)
                 exit_price = (fill or {}).get("price") or prices.get(sym)
                 if exit_price is None:
                     db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="DATA_FAULT",
@@ -558,7 +826,19 @@ class TradingAgent:
                 db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="ADOPT",
                                    reasons=[f"Adopted external position with stop {stop:.2f}"]))
                 continue
-            if abs(float(meta.qty) - bp.qty) > 1e-6:
+            held = float(meta.qty)
+            if bp.qty < held - 1e-6 and getattr(broker, "supports_broker_stops", False):
+                # Part of the position was sold at the broker (e.g. a take-profit leg partly filled).
+                reduced = held - bp.qty
+                fill = await self._exit_fill(db, broker, meta)
+                exit_price = float((fill or {}).get("price") or prices.get(sym) or meta.stop_price)
+                await self._record_trade(db, meta, exit_price, 0.0, "broker_exit", now, qty=reduced)
+                meta.qty = bp.qty
+                db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="SELL", qty=reduced,
+                                   reasons=[f"Broker sold {reduced:g} of {held:g} outside the bot at {exit_price:.2f}"]))
+            elif abs(held - bp.qty) > 1e-6:
+                db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="SYNC", qty=bp.qty,
+                                   reasons=[f"Quantity synced to the broker: {held:g} → {bp.qty:g}"]))
                 meta.qty = bp.qty
             # Use the broker's actual average fill as the entry price (once).
             if getattr(broker, "supports_broker_stops", False) and not (meta.meta or {}).get("entry_synced"):
@@ -566,6 +846,23 @@ class TradingAgent:
                     meta.entry_price = bp.avg_price
                 meta.meta = {**(meta.meta or {}), "entry_synced": True}
         await db.commit()
+
+    async def _exit_fill(self, db, broker, meta: BotPosition) -> Optional[Dict[str, Any]]:
+        """The real price a position (or part of it) was closed at outside the normal exit path."""
+        rows = (await db.execute(select(BotOrder).where(
+            BotOrder.symbol == meta.symbol, BotOrder.side == "SELL", BotOrder.status.in_(("filled", "partial")))
+            .order_by(BotOrder.id.desc()).limit(5))).scalars().all()
+        for row in rows:   # an exit whose confirmation was lost and has just been recovered
+            om = row.meta or {}
+            if om.get("recovered") and not om.get("booked") and row.fill_price:
+                row.meta = {**om, "booked": True}
+                return {"price": float(row.fill_price), "qty": float(row.qty), "via": "recovered_order"}
+        try:
+            return await broker.get_exit_fill(meta.symbol, (meta.meta or {}).get("entry_order_id"),
+                                              as_utc(meta.opened_at))
+        except Exception as e:
+            logger.warning("Could not read the exit fill for %s: %s", meta.symbol, e)
+            return None
 
     # ─── Position management ──────────────────────────────────────────────────
 
@@ -581,28 +878,6 @@ class TradingAgent:
         except Exception as e:
             frame = None
             logger.warning("No history to manage %s (%s); hard stop/target still enforced", sym, e)
-
-        # Unexplained huge gaps need a second observation before acting (bad ticks, unhandled splits).
-        if frame is not None and len(frame):
-            last_close = float(frame["close"].iloc[-1])
-            move = price / last_close - 1 if last_close else 0.0
-            m = dict(meta.meta or {})
-            if abs(move) > SUSPICIOUS_MOVE and not m.get("suspect_confirmed"):
-                if m.get("suspect_price") and abs(price / m["suspect_price"] - 1) < 0.10:
-                    m["suspect_confirmed"] = True
-                else:
-                    m["suspect_price"] = price
-                    meta.meta = m
-                    db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="DATA_FAULT",
-                                       reasons=[f"Price {price:.2f} is {move:+.0%} vs last close {last_close:.2f}; "
-                                                "waiting for confirmation before acting"]))
-                    await db.commit()
-                    await notify("suspicious_move", f"{sym} moved {move:+.0%}; awaiting confirmation", "warning")
-                    return None
-            elif abs(move) <= SUSPICIOUS_MOVE and (m.get("suspect_price") or m.get("suspect_confirmed")):
-                m.pop("suspect_price", None)
-                m.pop("suspect_confirmed", None)
-            meta.meta = m
 
         stop = float(meta.stop_price)
         if price <= stop:
@@ -634,13 +909,24 @@ class TradingAgent:
             new_stop, highest = update_trailing_stop(new_stop, float(meta.entry_price), highest, float(close), atr,
                                                      float(meta.entry_atr or atr), rt_cost, scfg)
         meta.highest_price = highest
-        if new_stop > stop + 1e-9:
+        m = dict(meta.meta or {})
+        raised = new_stop > stop + 1e-9
+        if raised:
             meta.stop_price = new_stop
-            if getattr(broker, "supports_broker_stops", False):
-                await self._renew_lease(db, token)
-                if not await broker.update_stop(sym, new_stop):
-                    await broker.ensure_protection(sym, qty, new_stop)
             db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="TRAIL", reasons=[f"Stop raised {stop:.2f} → {new_stop:.2f}"]))
+        if getattr(broker, "supports_broker_stops", False) and (raised or m.get("broker_stop_stale")):
+            await self._renew_lease(db, token)
+            want = float(meta.stop_price)
+            if await broker.update_stop(sym, want):
+                m.pop("broker_stop_stale", None)
+            else:
+                if not m.get("broker_stop_stale"):
+                    await notify("protection_failed", f"{sym}: broker stop could not be raised to {want:.2f}; the bot "
+                                                      "enforces it every cycle and keeps retrying", "warning")
+                m["broker_stop_stale"] = True
+                db.add(BotDecision(cycle_id=cycle_id, symbol=sym, action="ERROR",
+                                   reasons=[f"Broker stop update to {want:.2f} failed; retrying next cycle"]))
+        meta.meta = m
         await db.commit()
 
         score = float(frame["tech_score"].iloc[-1]) if not math.isnan(frame["tech_score"].iloc[-1]) else 0.0
@@ -696,14 +982,7 @@ class TradingAgent:
                     vetoes.append("Altman Z in the distress zone")
                 if fundamental.get("piotroski") is not None and fundamental["piotroski"] <= 2:
                     vetoes.append(f"Piotroski F-score {fundamental['piotroski']}/9")
-                nxt = fundamental.get("next_earnings")
-                if nxt and settings.EARNINGS_BLACKOUT_DAYS > 0:
-                    try:
-                        days = (date.fromisoformat(nxt) - exchange_today(sym, now)).days
-                        if 0 <= days <= settings.EARNINGS_BLACKOUT_DAYS:
-                            vetoes.append(f"Earnings in {days} day(s) ({nxt}): gap-risk blackout")
-                    except ValueError:
-                        pass
+                vetoes.extend(self._earnings_vetoes(sym, fundamental, now))
             if vetoes:
                 db.add(BotDecision(action="SKIP", reasons=vetoes + a.reasons, **base))
                 summary["skipped"] += 1
@@ -716,6 +995,28 @@ class TradingAgent:
         await db.commit()
         candidates.sort(key=lambda c: c["edge"].ev_r, reverse=True)
         return candidates
+
+    @staticmethod
+    def _earnings_vetoes(sym: str, fundamental: dict, now) -> List[str]:
+        n = settings.EARNINGS_BLACKOUT_DAYS
+        if n <= 0:
+            return []
+        if fundamental.get("earnings_unknown"):
+            return ["Earnings date unknown (calendar fetch failed): blackout can't be checked"]
+        start = fundamental.get("next_earnings")
+        if not start:
+            return []
+        end = fundamental.get("next_earnings_end") or start
+        try:
+            first, last = date.fromisoformat(start), date.fromisoformat(end)
+        except ValueError:
+            return []
+        today = exchange_today(sym, now)
+        # Unconfirmed dates come as a [start, end] window: blocked from N days before the start to the end.
+        if first - timedelta(days=n) <= today <= last:
+            window = start if end == start else f"{start} to {end}"
+            return [f"Earnings {window}: gap-risk blackout ({n}d before through the report)"]
+        return []
 
     def _correlations(self, sym: str, held: List[str], frames: Dict[str, pd.DataFrame], lookback: int = 60) -> Dict[str, float]:
         out = {}
@@ -768,9 +1069,10 @@ class TradingAgent:
                 verdict: Optional[Verdict] = None
                 if self.reviewer is not None:
                     try:
-                        verdict = await self.reviewer.review(
-                            self._review_payload(a, edge, decision, c), self._tool_handler(snap, prices))
-                    except Exception as e:  # reviewer bugs must not take the cycle down
+                        verdict = await asyncio.wait_for(self.reviewer.review(
+                            self._review_payload(a, edge, decision, c), self._tool_handler(snap, prices)),
+                            REVIEW_TIMEOUT_SECONDS)
+                    except Exception as e:  # reviewer bugs or timeouts must not take the cycle down
                         verdict = self.reviewer._fail_safe(f"{type(e).__name__}") if hasattr(self.reviewer, "_fail_safe") \
                             else Verdict("veto", 0.0, f"Reviewer error: {e}", source="fail_safe")
                     qty = int(math.floor(qty * verdict.size_multiplier))
@@ -798,21 +1100,32 @@ class TradingAgent:
                             continue
                         qty = min(qty, decision.qty)
 
-                result = await self._send_buy(db, broker, token, sym, qty, price, stop, target, cycle_id)
+                intent = {"stop": stop, "target": target, "atr": a.atr, "score": a.tech_score, "regime": a.regime,
+                          "cycle_id": cycle_id}
+                sent = await self._send_buy(db, broker, token, sym, qty, price, stop, target, cycle_id, intent, force)
+                if sent is None:   # halted, paused or flattened while this candidate was being prepared
+                    summary["blocked_reasons"] = ["Halted/paused during the cycle"]
+                    db.add(BotDecision(action="SKIP", reasons=["Halted/paused before the order was sent"], **base))
+                    await db.commit()
+                    break
+                order, result = sent
                 if not result.filled:
                     db.add(BotDecision(action="SKIP", reasons=[f"Entry {result.status}: {result.message}"], **base))
-                    await db.commit()
-                    if result.status == "rejected":
-                        await notify("order_rejected", f"{sym} entry rejected: {result.message}", "warning")
+                    await db.commit()   # a 'pending' outcome stays pending and is resolved next cycle
+                    if result.status in ("rejected", "pending"):
+                        await notify("order_rejected" if result.status == "rejected" else "order_unknown",
+                                     f"{sym} entry {result.status}: {result.message}", "warning")
                     continue
                 fill = result.fill_price or price
                 filled_qty = result.qty
+                # The position is committed together with the order's outcome.
                 db.add(BotPosition(
                     symbol=sym, qty=filled_qty, entry_price=fill, stop_price=stop, initial_stop=stop,
                     target_price=target, highest_price=fill, entry_atr=a.atr, entry_score=a.tech_score,
                     entry_costs=result.commission, opened_at=self.now(),
                     meta={"regime": a.regime, "edge": edge.to_dict(), "cycle_id": cycle_id,
-                          "blended_score": a.score, "fundamental": c.get("fundamental")},
+                          "blended_score": a.score, "fundamental": c.get("fundamental"),
+                          "entry_order_id": result.broker_order_id, "last_mark": fill},
                 ))
                 db.add(BotDecision(action="BUY", qty=filled_qty, expected_edge_pct=decision.expected_edge_pct,
                                    cost_pct=decision.cost_pct, reasons=decision.reasons + a.reasons,
@@ -831,11 +1144,34 @@ class TradingAgent:
                 db.add(BotDecision(action="ERROR", reasons=[f"Entry processing failed: {e}"], **base))
                 await db.commit()
 
-    async def _send_buy(self, db, broker, token, sym, qty, price, stop, target, cycle_id) -> OrderResult:
-        await self._renew_lease(db, token)
-        coid = f"bot-{cycle_id}-{sym}-buy"[:48]
+    async def _fence_entry(self, db, token: str, force: bool) -> bool:
+        """
+        Renew the lease only if we still own it AND the bot may still open trades.
+        One atomic UPDATE, so a panic button pressed at any point before it wins.
+        """
+        conds = [BotState.id == 1, BotState.lease_owner == token,
+                 BotState.flatten_requested.is_(False), BotState.halted.is_(False)]
+        if not force:
+            conds.append(BotState.enabled.is_(True))
+        res = await db.execute(update(BotState).where(*conds)
+                               .values(lease_until=self.now() + timedelta(seconds=LEASE_SECONDS))
+                               .execution_options(synchronize_session=False))
+        await db.commit()
+        if res.rowcount == 1:
+            return True
+        if await db.scalar(select(BotState.lease_owner).where(BotState.id == 1)) != token:
+            raise LeaseLost("trading lease lost")
+        return False
+
+    async def _send_buy(self, db, broker, token, sym, qty, price, stop, target, cycle_id, intent: dict,
+                        force: bool) -> Optional[Tuple[BotOrder, OrderResult]]:
+        """Send an entry; the caller commits its outcome together with the position."""
+        if not await self._fence_entry(db, token, force):
+            return None
+        coid = _coid(cycle_id, sym, "buy")
         order = BotOrder(symbol=sym, side="BUY", qty=qty, ref_price=price, status="pending", reason="entry",
-                         broker=getattr(broker, "name", "?"), broker_order_id=coid)
+                         broker=getattr(broker, "name", "?"), broker_order_id=coid,
+                         meta={"client_order_id": coid, **intent})
         db.add(order)
         await db.commit()
         result = await broker.buy(sym, qty, price, stop, target, client_order_id=coid)
@@ -846,14 +1182,15 @@ class TradingAgent:
             order.broker_order_id = result.broker_order_id
         if result.filled:
             order.qty = result.qty
-        await db.commit()
-        return result
+        return order, result
 
     # ─── Exits ────────────────────────────────────────────────────────────────
 
     async def _flatten(self, db, broker, token, reason: str, is_open: Dict[str, bool], prices: Optional[dict] = None) -> List[dict]:
         positions = await broker.get_positions()
-        tracked = {p.symbol for p in (await db.execute(select(BotPosition))).scalars()}
+        rows = {p.symbol: p for p in (await db.execute(select(BotPosition))).scalars()}
+        unresolved = set((await db.execute(select(BotOrder.symbol).where(BotOrder.status == "pending"))).scalars())
+        tracked = set(rows) | unresolved
         if prices is None or any(p.symbol not in prices for p in positions):
             quotes = await self.market.get_quotes([p.symbol for p in positions]) if positions else {}
             prices = {**(prices or {}), **{s: float(q["current_price"]) for s, q in quotes.items()
@@ -868,6 +1205,12 @@ class TradingAgent:
             if not open_now or not price:
                 results.append({"symbol": p.symbol, "status": "deferred",
                                 "reason": "market closed" if not open_now else "no price"})
+                continue
+            mark = ((rows[p.symbol].meta or {}).get("last_mark") if p.symbol in rows else None)
+            if mark and not getattr(broker, "supports_broker_stops", False) and \
+                    abs(price / float(mark) - 1) > SUSPICIOUS_MOVE:
+                # The simulator fills at our quote: never at an unconfirmed outlier.
+                results.append({"symbol": p.symbol, "status": "deferred", "reason": "price unconfirmed"})
                 continue
             try:
                 results.append(await self._exit(db, broker, token, p.symbol, p.qty, price, reason, "flatten"))
@@ -888,9 +1231,9 @@ class TradingAgent:
     async def _exit(self, db, broker, token, sym, qty, price, reason, cycle_id) -> dict:
         await self._renew_lease(db, token)
         meta = await db.get(BotPosition, sym)
-        coid = f"bot-{cycle_id}-{sym}-sell"[:48]
+        coid = _coid(cycle_id, sym, "sell")
         order = BotOrder(symbol=sym, side="SELL", qty=qty, ref_price=price, status="pending", reason=reason,
-                         broker=getattr(broker, "name", "?"), broker_order_id=coid)
+                         broker=getattr(broker, "name", "?"), broker_order_id=coid, meta={"client_order_id": coid})
         db.add(order)
         await db.commit()
         result = await broker.sell(sym, qty, price, client_order_id=coid,
@@ -959,7 +1302,7 @@ class TradingAgent:
             "factor_scores": a.components, "edge_estimate": edge.to_dict(),
             "expected_gross_edge_pct": decision.expected_edge_pct, "round_trip_cost_pct": decision.cost_pct,
             "fundamentals": {k: f.get(k) for k in ("composite", "piotroski", "altman_zone", "flags", "fair_value",
-                                                   "upside_pct", "next_earnings")} if f else None,
+                                                   "upside_pct", "next_earnings", "next_earnings_end")} if f else None,
             "expected_holding_period_days": "5-40",
         }
 

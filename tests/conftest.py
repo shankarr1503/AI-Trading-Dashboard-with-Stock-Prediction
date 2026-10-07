@@ -55,6 +55,8 @@ class FakeMarket:
         self.frames = frames
         self.price_override: dict = {}
         self.splits: dict = {}
+        self.stale_splits: dict = {}   # what a cached split list still says (e.g. on an ex-date)
+        self.split_calls: list = []
         self.quote_failures: set = set()
 
     async def get_history_df(self, symbol, period="1y", interval="1d"):
@@ -88,7 +90,10 @@ class FakeMarket:
     async def get_news(self, symbol):
         return []
 
-    async def get_splits(self, symbol):
+    async def get_splits(self, symbol, fresh=False):
+        self.split_calls.append((symbol, fresh))
+        if not fresh and symbol in self.stale_splits:
+            return self.stale_splits[symbol]
         return self.splits.get(symbol, [])
 
 

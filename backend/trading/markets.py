@@ -7,10 +7,23 @@ from zoneinfo import ZoneInfo
 US_TZ = ZoneInfo("America/New_York")
 IN_TZ = ZoneInfo("Asia/Kolkata")
 
+# Liquid instruments that print a daily bar on every trading day. Paper mode has
+# no exchange calendar, so "is today a trading day?" is answered from these
+# rather than from whichever (possibly halted or mistyped) universe symbol
+# happens to sort first.
+REFERENCE_SYMBOLS = {
+    "US": ("SPY", "QQQ", "DIA"),
+    "NSE": ("^NSEI", "RELIANCE.NS", "HDFCBANK.NS"),
+}
+
 
 def exchange_for(symbol: str) -> str:
     s = symbol.upper()
     return "NSE" if s.endswith(".NS") or s.endswith(".BO") else "US"
+
+
+def exchange_tz(symbol: str) -> ZoneInfo:
+    return IN_TZ if exchange_for(symbol) == "NSE" else US_TZ
 
 
 def is_regular_session(symbol: str, now: datetime) -> bool:

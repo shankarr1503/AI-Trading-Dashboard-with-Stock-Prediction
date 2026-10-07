@@ -189,11 +189,15 @@ class MarketDataService:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         return df.set_index("timestamp").astype(float)
 
-    async def get_splits(self, symbol: str) -> List[Dict[str, Any]]:
-        """Stock split history: [{"date": "YYYY-MM-DD", "ratio": 4.0}, ...] (cached 12h)."""
+    async def get_splits(self, symbol: str, fresh: bool = False) -> List[Dict[str, Any]]:
+        """
+        Stock split history: [{"date": "YYYY-MM-DD", "ratio": 4.0}, ...] (cached 12h).
+        `fresh=True` bypasses the cache — the agent asks for that whenever a held
+        position's price jumps, because on a split's ex-date the cached list is stale.
+        """
         symbol = validate_symbol(symbol)
         key = f"splits:{symbol}"
-        cached = await cache_get(key)
+        cached = None if fresh else await cache_get(key)
         if cached is not None:
             return cached
         async with _YF_SEMAPHORE:

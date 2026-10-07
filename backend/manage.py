@@ -11,7 +11,7 @@ import getpass
 import os
 import sys
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from backend.auth.utils import get_password_hash
 from backend.database.models import User
@@ -19,8 +19,9 @@ from backend.database.session import AsyncSessionLocal
 
 
 async def create_admin(email: str, username: str, password: str) -> str:
+    email = email.strip().lower()
     async with AsyncSessionLocal() as db:
-        user = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
+        user = (await db.execute(select(User).where(func.lower(User.email) == email))).scalar_one_or_none()
         if user is None:
             user = User(email=email, username=username, hashed_password=get_password_hash(password), is_superuser=True)
             db.add(user)
@@ -36,7 +37,7 @@ async def create_admin(email: str, username: str, password: str) -> str:
 
 async def revoke(email: str) -> bool:
     async with AsyncSessionLocal() as db:
-        user = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
+        user = (await db.execute(select(User).where(func.lower(User.email) == email.strip().lower()))).scalar_one_or_none()
         if user is None:
             return False
         user.token_version = (user.token_version or 0) + 1

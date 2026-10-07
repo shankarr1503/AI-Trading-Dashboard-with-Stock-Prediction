@@ -162,6 +162,8 @@ class BotState(Base):
     last_error = Column(Text)
     last_success_at = Column(TZDateTime)
     cashflow_checked_at = Column(TZDateTime)
+    # Broker cash-activity ids already applied to the high-water mark (id → first seen).
+    cashflow_seen = Column(JSON)
     updated_at = Column(TZDateTime, default=utcnow, onupdate=utcnow)
 
 
@@ -213,10 +215,14 @@ class BotOrder(Base):
     ref_price = Column(Money)
     fill_price = Column(Money)
     commission = Column(Money, default=0.0)
-    status = Column(String(20), nullable=False)  # filled / submitted / rejected
+    # pending (sent, outcome not yet journaled) / filled / partial / cancelled / rejected
+    status = Column(String(20), nullable=False, index=True)
     reason = Column(Text)
     broker = Column(String(20))
     broker_order_id = Column(String(64))
+    # client_order_id and, for entries, the intended stop/target so an order whose
+    # outcome was lost can be turned into a managed position on the next cycle.
+    meta = Column(JSON)
     created_at = Column(TZDateTime, default=utcnow, index=True)
 
 

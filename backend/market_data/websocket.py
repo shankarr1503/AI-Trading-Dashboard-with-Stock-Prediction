@@ -96,12 +96,25 @@ async def websocket_market_stream(websocket: WebSocket, symbol: str):
             (symbol not in manager.active_connections and len(manager.active_connections) >= MAX_SYMBOLS):
         await websocket.close(code=1013)
         return
-    try:
-        await market_data_service.get_quote(symbol)   # unknown symbols never get a poller
-    except ValueError:
-        await websocket.close(code=1008)
-        return
+    # Reserve the slot before the first await so concurrent connects can't all pass the cap.
     manager.per_ip[ip] = manager.per_ip.get(ip, 0) + 1
+    try:
+        try:
+            await market_data_service.get_quote(symbol)   # unknown symbols never get a poller
+        except ValueError:
+            await websocket.close(code=1008)
+            return
+        if symbol not in manager.active_connections and len(manager.active_connections) >= MAX_SYMBOLS:
+            await websocket.close(code=1013)
+            return
+        await _serve(websocket, symbol)
+    finally:
+        manager.per_ip[ip] = max(0, manager.per_ip.get(ip, 1) - 1)
+        if not manager.per_ip[ip]:
+            manager.per_ip.pop(ip, None)
+
+
+async def _serve(websocket: WebSocket, symbol: str):
     await manager.connect(websocket, symbol)
     try:
         while True:
@@ -118,4 +131,3 @@ async def websocket_market_stream(websocket: WebSocket, symbol: str):
         pass
     finally:
         manager.disconnect(websocket, symbol)
-        manager.per_ip[ip] = max(0, manager.per_ip.get(ip, 1) - 1)

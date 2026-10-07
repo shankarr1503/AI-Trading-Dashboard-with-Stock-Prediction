@@ -92,3 +92,25 @@ def test_walk_forward_out_of_sample():
     assert "sharpe" in wf["out_of_sample"]
     starts = [f["test_start"] for f in wf["folds"]]
     assert starts == sorted(starts)
+
+
+def test_backtest_honours_the_reentry_cooldown():
+    from backend.trading.risk import RiskConfig
+
+    data = {s: make_ohlcv(seed, n=700) for s, seed in (("A", 11), ("B", 12), ("C", 13))}
+
+    def quick_reentries(hours):
+        res = run_backtest(data, BacktestConfig(risk=RiskConfig(reentry_cooldown_hours=hours)), explore=True)
+        stops = {(t["symbol"], t["exit_date"]) for t in res.trades if t["exit_reason"] in ("stop", "stop_gap")}
+        quick = 0
+        for t in res.trades:
+            for sym, d in stops:
+                gap = np.busday_count(d, t["entry_date"])
+                if t["symbol"] == sym and 0 < gap <= 2:
+                    quick += 1
+        return quick, len(stops)
+
+    loose, stops = quick_reentries(0)
+    strict, _ = quick_reentries(72)          # 3 days → the next two signal bars are blocked
+    assert stops > 0 and loose > 0
+    assert strict == 0

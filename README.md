@@ -51,7 +51,9 @@ observe ──► analyse ──► estimate edge ──► risk manager ──�
 ```
 
 1. **Observe**: account, positions and quotes from the broker. Positions are reconciled with the bot's own
-   stop/target records; positions opened elsewhere are adopted with a protective stop.
+   stop/target records, including exits and partial fills that happened at the broker between cycles (booked at
+   the real fill price). Positions opened elsewhere are ignored unless `BOT_ADOPT_EXTERNAL_POSITIONS=true`, which
+   adopts them with a protective stop.
 2. **Protect first**: every cycle (even when paused) enforces hard stops, take-profits, trailing stops
    (breakeven + costs after +1.5 ATR, then a 3-ATR chandelier trail), signal-reversal exits and a 40-day time stop.
 3. **Analyse** (`backend/trading/strategy.py`) on **completed daily bars only**: trend (EMA 20/50/200 + MACD,
@@ -68,16 +70,18 @@ observe ──► analyse ──► estimate edge ──► risk manager ──�
    - minimum expectancy (0.10R) and reward:risk (1.5)
    - correlation limit vs. existing positions (including ones opened earlier in the same cycle), max 8 positions
    - size halves in high-volatility regimes, halves again until the edge is calibrated, and shrinks as drawdown grows
-   - no re-entry for 24h after a stop-out; skip if price gapped > 2 ATR from the signal
+   - no re-entry for 24h after a stop-out, nor on the same day after any exit; skip if price gapped > 2 ATR from
+     the signal
    - **circuit breakers**: −2% day → no new entries; 4 consecutive losses → 24h cooldown;
-     −10% from the high-water mark → **kill switch** (flatten everything and halt until an admin resets it).
-     Deposits/withdrawals are excluded from these numbers.
+     −10% from the high-water mark → **kill switch** (flatten everything, halt and pause until an admin resets the
+     halt *and* restarts the bot). Deposits/withdrawals are excluded from these numbers (each broker cash activity
+     is counted once; if they can't be read, the breakers are frozen for that cycle rather than guessing).
    - with a real broker, no entries at all until `/calibrate` has stored ≥ 30 out-of-sample trades with positive
      expectancy
 6. **Claude review (optional)**: with `LLM_REVIEW_ENABLED=true`, Claude (`claude-opus-5-5`) investigates each
    approved trade using read-only tools (price history, headlines, portfolio). It looks for things price signals
    miss, such as earnings inside the holding period, fraud probes or halts. It can only **approve, shrink or veto**,
-   never enlarge a trade. If the API fails, the default is to veto.
+   never enlarge a trade. If the API fails or a review takes longer than 90 s, the default is to veto.
 7. **Execute**: paper broker (fills at the live quote ± spread/slippage/fees), or Alpaca with **GTC bracket
    orders** whose fills are confirmed by polling. Every cycle verifies each position has a broker-side stop and
    re-arms it if missing; exits cancel every bracket leg first and re-protect the position if the close fails.
@@ -86,11 +90,18 @@ observe ──► analyse ──► estimate edge ──► risk manager ──�
 ### Operational safety
 
 - **One trader**: a DB lease with a unique token per cycle, renewed and re-checked before every order.
-- **Durable**: each order is journaled before it is sent and committed right after; one failing symbol cannot roll
-  back the others.
-- **Fail safe on bad data**: a held position without a price freezes equity/high-water-mark/breakers, blocks entries
-  and alerts. Stock splits rescale stops; unexplained > 30% moves need a second observation before triggering exits.
-- **Panic button** (`/flatten`): durable halt + flatten request; in-flight cycles stop opening trades immediately.
+- **Durable**: each order is journaled as `pending` before it is sent; its outcome is committed together with the
+  resulting position or trade. If the outcome is lost (network timeout, crash, a cancel that wasn't confirmed), the
+  next cycle looks the order up at the broker by its unique client order id: a fill becomes a managed position with
+  the stop and target it was sent with, never an orphan. One failing symbol cannot roll back the others.
+- **Fail safe on bad data**: a held position without a trustworthy price freezes equity/high-water-mark/breakers,
+  blocks entries and alerts. A price more than 30% away from the last accepted mark is not used for equity, the kill
+  switch, exits or paper fills until a split explains it (the split feed is re-read without its cache, and at Alpaca
+  the position's own split adjustment is followed) or a second observation confirms it.
+- **Panic button** (`/flatten`): durable halt + flatten request. Every entry is fenced atomically against the flag
+  right before it is sent, so nothing new is sent after the press; a cycle that is already running flattens before
+  it finishes, otherwise the request closes positions immediately. Positions in closed markets are closed at the
+  next open.
 - **Alerts** to `ALERT_WEBHOOK_URL` (kill switch, flatten, data faults, failed cycles, rejected orders, missing broker
   stops) and a heartbeat (`GET /api/bot/health`, container healthcheck).
 
@@ -142,7 +153,12 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Open http://localhost. The **first account you register becomes the administrator** (bot controls).
+Open http://localhost (published on loopback only; see `HTTP_BIND`). Create the administrator (bot controls)
+with the CLI, since registration never grants admin rights outside development:
+
+```bash
+docker compose exec backend python -m backend.manage create-admin --email you@example.com --username admin
+```
 
 ### Local development
 
@@ -176,13 +192,13 @@ cd frontend && npm run lint && npm run typecheck && npm run build
 
 | Method | Path | Who | |
 |---|---|---|---|
-| GET | `/status` `/positions` `/trades` `/orders` `/decisions` `/equity` `/performance` | user | State and journal |
+| GET | `/status` `/positions` `/trades` `/orders` `/decisions` `/equity` `/performance` | admin | State and journal |
 | GET | `/analyze/{symbol}` | user | What the bot thinks now (no order placed) |
-| POST | `/backtest` | user | Backtest / walk-forward |
+| POST | `/backtest` | admin | Backtest / walk-forward |
 | POST | `/start` `/stop` | admin | Enable entries / pause entries (stops stay enforced) |
 | POST | `/run-once` | admin | Run one full cycle now |
 | POST | `/flatten` | admin | Panic button: close everything and pause |
-| POST | `/reset-halt` | admin | Acknowledge a circuit-breaker halt |
+| POST | `/reset-halt` | admin | Acknowledge a circuit-breaker halt (the bot stays paused until `/start`) |
 | PUT | `/config` | admin | Adjust risk limits (within hard bounds) and the universe |
 | POST | `/calibrate` | admin | Walk-forward calibrate the live edge estimates |
 
@@ -194,11 +210,22 @@ See `.env.example`. Key settings: `TRADING_MODE`, `ALLOW_LIVE_TRADING`, `BOT_UNI
 ## Production checklist
 
 - `JWT_SECRET_KEY` = `openssl rand -hex 32` (the Docker stack refuses to start without a strong secret).
-- `BOOTSTRAP_ADMIN_EMAIL` = your email, register, then set `REGISTRATION_OPEN=false`
-  (or `python -m backend.manage create-admin`). `POST /auth/logout-all` revokes every session.
-- Put the stack behind **HTTPS** (e.g. Caddy or a load balancer with a certificate); never send tokens over plain HTTP.
+- Create the admin with `python -m backend.manage create-admin`, then set `REGISTRATION_OPEN=false` if nobody else
+  should sign up. `POST /auth/logout-all` (or `manage revoke-tokens`) revokes every session.
+- Put the stack behind **HTTPS** (e.g. Caddy or a load balancer with a certificate). nginx publishes plain HTTP on
+  `HTTP_BIND` (default `127.0.0.1`); never expose that port to the internet.
 - Set `ALERT_WEBHOOK_URL` and point an uptime monitor at `/api/bot/health`.
 - Use a **dedicated broker account** for the bot (`BOT_ADOPT_EXTERNAL_POSITIONS=false` ignores other holdings).
+
+## When the bot halts (runbook)
+
+1. Read `GET /api/bot/status` (`halt_reason`, `last_error`, `flatten_requested`) and the latest `/decisions`.
+2. Kill switch or `/flatten`: positions are closed as markets open; `flatten_requested` clears once nothing the bot
+   owns is left. Check the broker directly if alerts mention `exit_failed` or `protection_failed`.
+3. `DATA_FAULT` / `degraded`: a held symbol has no trustworthy price, or deposits/withdrawals couldn't be read.
+   Stops keep being enforced at the broker (Alpaca); fix the data source, nothing needs resetting.
+4. `RECOVER` decisions: an order's confirmation was lost and has been reconciled; verify it against the broker.
+5. When you understand what happened: `POST /reset-halt` (re-bases the high-water mark), then `POST /start`.
 
 ## Before risking real money
 
@@ -210,11 +237,14 @@ See `.env.example`. Key settings: `TRADING_MODE`, `ALLOW_LIVE_TRADING`, `BOT_UNI
 
 ## Known limitations
 
-- Daily-bar strategy; it is not a high-frequency system. Paper mode detects holidays from Yahoo data but not early
-  closes; Alpaca modes use the broker clock.
+- Daily-bar strategy; it is not a high-frequency system. Paper mode detects holidays from Yahoo data on reference
+  instruments (SPY/QQQ/DIA, NIFTY) but not early closes; Alpaca modes use the broker clock.
+- Paper splits rely on Yahoo's split feed (re-read without the cache whenever a held price jumps). If Yahoo has no
+  record of a split at all, the move is treated as a real one after a second observation.
 - Backtests and calibration use today's symbols (survivorship bias) and a flat cost model that is not liquidity-aware,
   so results are optimistic for small or illiquid names. ML and sentiment are not backtested (hence veto-only).
 - The walk-forward resets the high-water mark per fold; the daily-loss window follows the New York calendar date.
+- Live `costs` in the trade journal count commissions and fees; backtest `costs` also include spread and slippage.
 - Long-only. Shorting is intentionally not implemented (unbounded loss).
 - Yahoo Finance data is free but unofficial and can be delayed or rate-limited.
 - Alpaca supports US equities only; NSE symbols work in the dashboard, backtests and the paper broker.

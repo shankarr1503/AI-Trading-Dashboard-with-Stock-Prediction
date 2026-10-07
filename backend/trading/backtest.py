@@ -181,6 +181,11 @@ def run_backtest(
     cooldown_until_bar = -1
     paused_until_bar = -1
     last_close: Dict[str, float] = {}
+    # Same rule as the live agent: no re-entry within reentry_cooldown_hours of a
+    # stop-out. Live checks the signal of the stop day on the next day, i.e. one
+    # bar later already covers 24h; each further day blocks one more signal bar.
+    last_stop_bar: Dict[str, int] = {}
+    reentry_block_bars = max(0, math.ceil(cfg.risk.reentry_cooldown_hours / 24) - 1)
 
     def cm_for(sym: str) -> CostModel:
         return cfg.cost_model or cost_model_for(sym)
@@ -205,6 +210,8 @@ def run_backtest(
             "costs": round(costs, 2), "entry_score": p.entry_score,
             "bars_held": bar_idx - p.entry_bar, "exit_reason": reason,
         })
+        if reason in ("stop", "stop_gap", "kill_switch"):
+            last_stop_bar[p.symbol] = global_bar
         consecutive_losses = consecutive_losses + 1 if pnl <= 0 else 0
         if consecutive_losses >= cfg.risk.max_consecutive_losses:
             cooldown_until_bar = global_bar + max(1, int(round(cfg.risk.cooldown_hours / 24)))
@@ -324,6 +331,8 @@ def run_backtest(
         for sym, f in frames.items():
             if sym in positions or sym in pending_entries:
                 continue
+            if sym in last_stop_bar and global_bar - last_stop_bar[sym] < reentry_block_bars:
+                continue
             i = pos_in[sym].get(date)
             if i is None or i < scfg.min_history:
                 continue
@@ -343,9 +352,10 @@ def run_backtest(
         reserved = 0.0
         for ev_r, sym, price, stop, target, atr, score, regime, edge in sorted(candidates, reverse=True):
             corr = {}
-            if positions:
+            if positions or pending_entries:
                 window = returns.loc[:date].iloc[-cfg.correlation_lookback:]
-                for held in positions:
+                # Entries approved earlier this bar count too (as in the live agent).
+                for held in list(positions) + list(pending_entries):
                     if sym in window and held in window:
                         corr[held] = float(window[sym].corr(window[held]))
             decision = risk.evaluate(

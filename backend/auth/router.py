@@ -32,29 +32,23 @@ def _issue_tokens(user: User) -> Token:
 @limiter.limit("10/minute")
 async def register(request: Request, user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     """
-    Register a new user. The administrator is the account whose email matches
-    BOOTSTRAP_ADMIN_EMAIL; without it, only in development does the first
-    account become admin (otherwise use `python -m backend.manage create-admin`).
+    Register a new user. Registration never grants admin rights outside
+    development (no email verification exists, so a claimed address proves
+    nothing): create the administrator with `python -m backend.manage create-admin`.
+    In development the very first account becomes admin for convenience.
     """
     if not settings.REGISTRATION_OPEN:
         raise HTTPException(status_code=403, detail="Registration is closed")
+    email = user_data.email.strip().lower()
     existing = await db.execute(
-        select(User).where(or_(User.email == user_data.email, User.username == user_data.username))
+        select(User).where(or_(func.lower(User.email) == email, User.username == user_data.username))
     )
     if existing.scalars().first():
         raise HTTPException(status_code=400, detail="Could not register with these details")
 
-    bootstrap = settings.BOOTSTRAP_ADMIN_EMAIL.strip().lower()
-    if bootstrap:
-        make_admin = user_data.email.lower() == bootstrap
-    elif settings.is_development:
-        make_admin = (await db.scalar(select(func.count()).select_from(User))) == 0
-    else:
-        make_admin = False
-    if make_admin and await db.scalar(select(func.count()).select_from(User).where(User.is_superuser.is_(True))):
-        make_admin = False  # never mint a second admin through registration
+    make_admin = settings.is_development and (await db.scalar(select(func.count()).select_from(User))) == 0
     user = User(
-        email=user_data.email,
+        email=email,
         username=user_data.username,
         full_name=user_data.full_name,
         hashed_password=get_password_hash(user_data.password),
@@ -72,7 +66,7 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
 @limiter.limit("10/minute")
 async def login(request: Request, credentials: UserLogin, db: AsyncSession = Depends(get_db)):
     """Login and receive JWT tokens."""
-    result = await db.execute(select(User).where(User.email == credentials.email))
+    result = await db.execute(select(User).where(func.lower(User.email) == credentials.email.strip().lower()))
     user = result.scalar_one_or_none()
     password_ok = verify_password(credentials.password, user.hashed_password if user else _DUMMY_HASH)
     if not user or not password_ok:

@@ -17,7 +17,9 @@ from backend.database.models import (
 from backend.database.session import get_db, utcnow
 from backend.market_data.service import market_data_service, validate_symbol
 from backend.ratelimit import limiter
-from backend.trading.agent import OOS_KEY, POOLED_KEY, TradingAgent, effective_configs, get_state, load_oos
+from backend.trading.agent import (
+    OOS_KEY, POOLED_KEY, TradingAgent, config_error, effective_configs, get_state, load_oos,
+)
 from backend.trading.backtest import BacktestConfig, run_backtest, walk_forward
 from backend.trading.risk import RiskConfig
 
@@ -78,6 +80,7 @@ async def status(db: AsyncSession = Depends(get_db), user: User = Depends(admin_
         "consecutive_failures": state.consecutive_failures,
         "consecutive_data_faults": state.consecutive_data_faults,
         "last_error": state.last_error,
+        "config_error": config_error(state),
         "last_success_at": state.last_success_at,
         "calibration": await load_oos(db),
         "mode": settings.TRADING_MODE,
@@ -119,7 +122,10 @@ async def stop(db: AsyncSession = Depends(get_db), admin: User = Depends(get_cur
 
 @router.post("/reset-halt")
 async def reset_halt(db: AsyncSession = Depends(get_db), admin: User = Depends(get_current_superuser)):
-    """Acknowledge a circuit-breaker halt. Resets the high-water mark to current equity."""
+    """
+    Acknowledge a circuit-breaker halt. Resets the high-water mark to current
+    equity and leaves the bot paused: trading resumes only with an explicit /start.
+    """
     state = await get_state(db)
     if not state.halted:
         raise HTTPException(status_code=409, detail="Bot is not halted")
@@ -128,6 +134,7 @@ async def reset_halt(db: AsyncSession = Depends(get_db), admin: User = Depends(g
     state.flatten_requested = False
     last_eq = (await db.execute(select(EquitySnapshot).order_by(desc(EquitySnapshot.timestamp)).limit(1))).scalar_one_or_none()
     state.halted, state.halt_reason, state.halted_at = False, None, None
+    state.enabled = False
     state.consecutive_losses, state.cooldown_until = 0, None
     if last_eq:
         state.high_water_mark = last_eq.equity
