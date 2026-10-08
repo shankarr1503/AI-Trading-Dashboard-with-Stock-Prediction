@@ -4,10 +4,9 @@ import '../styles/globals.css';
 
 // next/font downloads the fonts at build time and serves them from /_next/static/media, so the
 // app (including the offline desktop build) never needs Google's font servers at runtime.
-// `--font-inter` / `--font-mono` let CSS and Tailwind refer to the self-hosted families.
+// `--font-inter` / `--font-mono` let CSS and Tailwind (`font-sans` / `font-mono`) refer to them.
 const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
-// Not preloaded: only the numeric widgets use it, and a preload on pages without them is wasted.
-const mono = JetBrains_Mono({ subsets: ['latin'], variable: '--font-mono', preload: false });
+const mono = JetBrains_Mono({ subsets: ['latin'], variable: '--font-mono' });
 
 export const metadata: Metadata = {
   title: 'AI Trading Platform — Real-Time Market Analytics & Predictions',
