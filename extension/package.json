@@ -1,0 +1,14 @@
+{
+  "name": "ai-trading-bot-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome (Manifest V3) companion for the AI Trading Bot. No build step: load this folder unpacked.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "pack": "node scripts/pack.mjs"
+  }
+}

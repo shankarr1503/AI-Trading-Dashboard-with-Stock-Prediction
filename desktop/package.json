@@ -1,0 +1,100 @@
+{
+  "name": "ai-trading-bot-desktop",
+  "productName": "AI Trading Bot",
+  "version": "1.0.0",
+  "description": "Desktop app for the AI Trading Bot: the dashboard and the risk-managed trading bot, running locally.",
+  "author": "AI Trading Bot contributors",
+  "homepage": "https://github.com/shankarr1503/AI-Trading-Dashboard-with-Stock-Prediction",
+  "private": true,
+  "main": "main.js",
+  "desktopName": "ai-trading-bot.desktop",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test \"test/*.test.js\"",
+    "smoke": "node scripts/smoke.mjs",
+    "pack": "electron-builder --dir --publish never",
+    "dist": "electron-builder --publish never",
+    "dist:win": "electron-builder --win nsis --x64 --publish never",
+    "dist:mac": "electron-builder --mac dmg zip --publish never",
+    "dist:linux": "electron-builder --linux AppImage --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "44.7.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.aitradingbot.desktop",
+    "productName": "AI Trading Bot",
+    "copyright": "Copyright © 2026 AI Trading Bot contributors",
+    "artifactName": "AI-Trading-Bot-${version}-${os}-${arch}.${ext}",
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "lib/**/*.js",
+      "pages/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist-backend/tradebot-backend",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "beforePack": "scripts/before-pack.js",
+    "asar": true,
+    "publish": null,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AI Trading Bot",
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "AI-Trading-Bot-Setup-${version}-${arch}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.finance",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "dmg": {
+      "title": "AI Trading Bot ${version}"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Finance",
+      "executableName": "ai-trading-bot",
+      "synopsis": "AI trading dashboard and risk-managed trading bot",
+      "syncDesktopName": true
+    }
+  }
+}

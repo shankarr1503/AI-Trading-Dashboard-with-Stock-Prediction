@@ -19,6 +19,10 @@ router = APIRouter()
 _DUMMY_HASH = get_password_hash("timing-equaliser-not-a-password")
 
 
+async def _user_count(db: AsyncSession) -> int:
+    return int(await db.scalar(select(func.count()).select_from(User)) or 0)
+
+
 def _issue_tokens(user: User) -> Token:
     claims = {"sub": str(user.id), "ver": user.token_version or 0}
     return Token(
@@ -36,8 +40,15 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
     development (no email verification exists, so a claimed address proves
     nothing): create the administrator with `python -m backend.manage create-admin`.
     In development the very first account becomes admin for convenience.
+
+    The desktop app (DESKTOP_MODE) is single-user and only listens on 127.0.0.1:
+    the first account is its owner and administrator, and registration closes
+    as soon as any account exists, whatever REGISTRATION_OPEN says.
     """
-    if not settings.REGISTRATION_OPEN:
+    if settings.DESKTOP_MODE:
+        if await _user_count(db) > 0:
+            raise HTTPException(status_code=403, detail="Registration is closed")
+    elif not settings.REGISTRATION_OPEN:
         raise HTTPException(status_code=403, detail="Registration is closed")
     email = user_data.email.strip().lower()
     existing = await db.execute(
@@ -46,7 +57,10 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
     if existing.scalars().first():
         raise HTTPException(status_code=400, detail="Could not register with these details")
 
-    make_admin = settings.is_development and (await db.scalar(select(func.count()).select_from(User))) == 0
+    if settings.DESKTOP_MODE:
+        make_admin = True     # the count above was 0
+    else:
+        make_admin = settings.is_development and (await _user_count(db)) == 0
     user = User(
         email=email,
         username=user_data.username,
@@ -59,6 +73,10 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
         await db.flush()
     except Exception:
         raise HTTPException(status_code=400, detail="Could not register with these details")
+    if settings.DESKTOP_MODE and await _user_count(db) != 1:
+        # Two "first" registrations raced: the later one must not become a second
+        # owner. Raising makes get_db roll this insert back.
+        raise HTTPException(status_code=403, detail="Registration is closed")
     return user
 
 

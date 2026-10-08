@@ -4,10 +4,14 @@ Bot runner process: `python -m backend.trading.runner`
 Runs one agent cycle every BOT_CYCLE_MINUTES. Deploy it as its own service
 (docker-compose `bot`) rather than inside the API workers, so exactly one
 process drives the bot; the database lease guards against accidental doubles.
+
+The loop itself (`run_forever`) is shared with the desktop sidecar
+(backend/desktop.py), which runs it as a background task next to the API.
 """
 import asyncio
 import logging
 import signal
+from typing import Optional
 
 from backend.config import settings
 from backend.trading.agent import TradingAgent
@@ -16,17 +20,17 @@ logging.basicConfig(level=settings.LOG_LEVEL, format="%(asctime)s [%(levelname)s
 logger = logging.getLogger("trading.runner")
 
 
-async def main() -> None:
-    agent = TradingAgent(owner="runner")
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:  # pragma: no cover - Windows
-            pass
-
-    interval = max(1, settings.BOT_CYCLE_MINUTES) * 60
+async def run_forever(stop: asyncio.Event, agent: Optional[TradingAgent] = None,
+                      interval: Optional[float] = None) -> None:
+    """
+    Run a cycle, then wait BOT_CYCLE_MINUTES (or until `stop` is set), until `stop`
+    is set. `stop` is only checked between cycles: a cycle that has started always
+    runs to completion, so stopping can never interrupt an order mid-flight.
+    `interval` (seconds) overrides BOT_CYCLE_MINUTES; tests use it.
+    """
+    agent = agent or TradingAgent(owner="runner")
+    if interval is None:
+        interval = max(1, settings.BOT_CYCLE_MINUTES) * 60
     if settings.LLM_REVIEW_ENABLED and not settings.ANTHROPIC_API_KEY:
         logger.warning("LLM_REVIEW_ENABLED=true but ANTHROPIC_API_KEY is empty: reviews will use the fail mode (%s)",
                        settings.LLM_REVIEW_FAIL_MODE)
@@ -48,6 +52,17 @@ async def main() -> None:
         except asyncio.TimeoutError:
             pass
     logger.info("Trading runner stopped")
+
+
+async def main() -> None:
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:  # pragma: no cover - Windows
+            pass
+    await run_forever(stop, TradingAgent(owner="runner"))
 
 
 if __name__ == "__main__":

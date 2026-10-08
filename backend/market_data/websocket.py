@@ -12,6 +12,7 @@ from typing import Dict, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from backend.auth.utils import decode_token
+from backend.config import settings
 from backend.market_data.service import market_data_service, validate_symbol
 from backend.ratelimit import client_ip
 
@@ -21,6 +22,13 @@ router = APIRouter()
 POLL_SECONDS = 5.0
 MAX_SYMBOLS = 50          # distinct symbols with a live poller
 MAX_CONNECTIONS_PER_IP = 5
+# The desktop app serves one local user: every window, tab and the Chrome
+# extension connects from 127.0.0.1, so the per-IP cap would lock them out.
+DESKTOP_MAX_CONNECTIONS = 50
+
+
+def _per_ip_limit() -> int:
+    return DESKTOP_MAX_CONNECTIONS if settings.DESKTOP_MODE else MAX_CONNECTIONS_PER_IP
 
 
 class ConnectionManager:
@@ -92,7 +100,7 @@ async def websocket_market_stream(websocket: WebSocket, symbol: str):
         await websocket.close(code=1008)
         return
     ip = client_ip(websocket)  # type: ignore[arg-type]
-    if manager.per_ip.get(ip, 0) >= MAX_CONNECTIONS_PER_IP or \
+    if manager.per_ip.get(ip, 0) >= _per_ip_limit() or \
             (symbol not in manager.active_connections and len(manager.active_connections) >= MAX_SYMBOLS):
         await websocket.close(code=1013)
         return

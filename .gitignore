@@ -61,3 +61,15 @@ Thumbs.db
 trading.db
 *.tsbuildinfo
 frontend/next-env.d.ts
+
+# Desktop sidecar build (packaging/build_backend.py)
+build-backend/
+dist-backend/
+
+# Chrome extension package (extension/scripts/pack.mjs)
+extension/dist/
+
+# Desktop app (desktop/): electron-builder output. desktop/build/ is electron-builder's
+# buildResources folder (icon, macOS entitlements) and must stay in the repository.
+desktop/dist/
+!desktop/build/

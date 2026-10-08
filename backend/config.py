@@ -2,7 +2,8 @@
 Application configuration using Pydantic Settings.
 Loads values from environment variables / .env file.
 """
-from typing import List
+import os
+from typing import List, Optional
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -10,11 +11,20 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 INSECURE_JWT_DEFAULT = "change-this-secret-key-in-production"
 
 
+def _env_file() -> Optional[str]:
+    # The desktop sidecar (backend/desktop.py) loads <data dir>/settings.env into the
+    # environment itself, so it must never pick up a stray .env from whatever
+    # directory the app happened to be started in.
+    if os.environ.get("DESKTOP_MODE", "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+    return ".env"
+
+
 class Settings(BaseSettings):
     # `.env.example` documents keys consumed by other services (Postgres,
     # docker-compose, frontend), so unknown keys must be ignored, not rejected.
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_env_file(),
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore",
@@ -60,7 +70,21 @@ class Settings(BaseSettings):
     # Registration never grants admin outside development (there is no email
     # verification, so an email address proves nothing). Create the
     # administrator with `python -m backend.manage create-admin`.
+    # In DESKTOP_MODE this flag is ignored: the first account becomes the
+    # administrator and registration closes once any account exists.
     REGISTRATION_OPEN: bool = True
+
+    # ─── Desktop app ─────────────────────────────────────────────────────────
+    # Set by the desktop sidecar launcher (`python -m backend.desktop`), never by
+    # hand: single-user mode on 127.0.0.1 serving the static frontend export.
+    DESKTOP_MODE: bool = False
+    # Where the sidecar keeps trading.db, secret.key, settings.env and logs/.
+    TRADEBOT_DATA_DIR: str = ""
+    # Static frontend export (frontend/out) served at "/" in desktop mode.
+    TRADEBOT_STATIC_DIR: str = ""
+    # Random per launch (set by the Electron shell). Enables /api/desktop/* when
+    # set; requests must carry it in the X-Desktop-Token header.
+    TRADEBOT_CONTROL_TOKEN: str = ""
 
     # ─── CORS ────────────────────────────────────────────────────────────────
     # Comma-separated list. Kept as a plain string because pydantic-settings

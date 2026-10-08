@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Trading Bot</title>
+  <link rel="stylesheet" href="base.css">
+  <link rel="stylesheet" href="popup.css">
+  <script type="module" src="popup.js"></script>
+</head>
+<body>
+  <header class="top">
+    <img src="icons/icon32.png" width="22" height="22" alt="">
+    <div class="brand">
+      <strong>AI Trading Bot</strong>
+      <span id="conn" class="conn" data-state="pending"><span class="dot" aria-hidden="true"></span><span id="conn-text">Connecting…</span></span>
+    </div>
+    <button id="refresh" class="icon-btn" type="button" title="Refresh now" aria-label="Refresh now">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+    </button>
+    <button id="open-options" class="icon-btn" type="button" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+    </button>
+  </header>
+
+  <main>
+    <section id="notice" class="card notice" hidden>
+      <p id="notice-title" class="notice-title"></p>
+      <p id="notice-text" class="notice-text"></p>
+      <div class="actions">
+        <button id="notice-retry" class="btn" type="button">Retry</button>
+        <button id="notice-options" class="btn primary" type="button">Open settings</button>
+      </div>
+    </section>
+
+    <section id="bot" class="card" hidden aria-labelledby="bot-state">
+      <div class="state-row">
+        <span id="bot-state" class="state-pill" data-state="">—</span>
+        <span id="bot-mode" class="tag"></span>
+        <span id="bot-updated" class="updated"></span>
+      </div>
+      <p id="bot-reason" class="reason" hidden></p>
+      <ul id="bot-warnings" class="warnings"></ul>
+      <dl class="metrics">
+        <div><dt>Equity</dt><dd id="m-equity" class="num">—</dd></div>
+        <div><dt>Drawdown</dt><dd id="m-drawdown" class="num">—</dd></div>
+        <div><dt>Daily P&amp;L</dt><dd id="m-daily" class="num">—</dd></div>
+        <div><dt>Last cycle</dt><dd id="m-cycle">—</dd></div>
+      </dl>
+      <div class="actions controls">
+        <button id="btn-start" class="btn go" type="button">Start</button>
+        <button id="btn-pause" class="btn" type="button">Pause</button>
+        <button id="btn-dashboard" class="btn ghost" type="button">Open dashboard</button>
+      </div>
+      <div class="panic">
+        <button id="btn-panic" class="btn danger-outline" type="button">PANIC FLATTEN</button>
+        <div id="panic-confirm" class="panic-confirm" hidden role="alertdialog" aria-labelledby="panic-q">
+          <p id="panic-q"><strong>Close every open position at market and halt the bot?</strong></p>
+          <p class="hint">The bot stays halted until you reset it in the dashboard. This cannot be undone.</p>
+          <div class="actions">
+            <button id="btn-panic-cancel" class="btn" type="button">Cancel</button>
+            <button id="btn-panic-confirm" class="btn danger" type="button">Yes, flatten everything</button>
+          </div>
+        </div>
+      </div>
+      <p id="bot-msg" class="msg" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="positions" class="card" hidden>
+      <h2>Open positions <span id="pos-count" class="count"></span></h2>
+      <table id="pos-table" class="table" hidden>
+        <thead><tr><th>Symbol</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">Stop</th><th class="r">Unreal. P&amp;L</th></tr></thead>
+        <tbody id="pos-body"></tbody>
+      </table>
+      <p id="pos-msg" class="msg"></p>
+    </section>
+
+    <details id="decisions" class="card" hidden>
+      <summary><h2>Recent decisions</h2></summary>
+      <ul id="dec-list" class="decisions"></ul>
+      <p id="dec-msg" class="msg"></p>
+    </details>
+
+    <section id="ticker" class="card" hidden>
+      <h2>Ticker analysis</h2>
+      <form id="ticker-form" class="ticker-form" autocomplete="off">
+        <input id="ticker-input" type="text" placeholder="Symbol, e.g. AAPL or RELIANCE.NS" maxlength="20" spellcheck="false" aria-label="Ticker symbol">
+        <button id="ticker-go" class="btn primary" type="submit">Analyze</button>
+      </form>
+      <p id="ticker-source" class="hint"></p>
+      <p id="ticker-msg" class="msg"></p>
+      <div id="quote" class="quote" hidden></div>
+      <div id="analysis" class="sub" hidden></div>
+      <div id="fundamentals" class="sub" hidden></div>
+    </section>
+  </main>
+
+  <footer>Educational analysis, not financial advice · v<span id="version"></span></footer>
+</body>
+</html>

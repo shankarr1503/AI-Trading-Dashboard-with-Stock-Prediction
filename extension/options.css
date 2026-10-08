@@ -1,0 +1,35 @@
+body { min-height: 100vh; }
+
+.page { max-width: 640px; margin: 0 auto; padding: 24px 16px 48px; display: grid; gap: 16px; }
+
+.page-head { display: flex; align-items: center; gap: 14px; }
+.page-head img { border-radius: 10px; flex: none; }
+.page-head h1 { font-size: 20px; }
+.page-head .hint { margin-top: 2px; }
+
+.card h2 { margin-bottom: 10px; }
+.card .lead { margin: 0 0 12px; color: var(--text-2); }
+.card p { overflow-wrap: anywhere; }
+
+code, .mono { font-family: var(--mono); font-size: 12px; }
+code { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; }
+
+.stack { display: grid; gap: 6px; }
+.stack label { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.stack .actions { margin-top: 8px; }
+
+.signed-in { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.signed-in p { margin: 0; }
+
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.row select.poll { width: auto; min-width: 72px; }
+
+.toggles { border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; padding: 8px 12px 10px; }
+.toggles legend { color: var(--muted); font-size: 12px; padding: 0 4px; }
+.toggles label { display: flex; align-items: flex-start; gap: 8px; padding: 4px 0; cursor: pointer; }
+.toggles input { margin-top: 2px; accent-color: var(--accent); }
+
+@media (max-width: 480px) {
+  .page { padding: 16px; }
+  .actions .btn { flex: 1 1 auto; }
+}

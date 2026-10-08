@@ -182,11 +182,83 @@ cd frontend && npm ci && npm run dev      # http://localhost:3000
 ### Tests
 
 ```bash
-python -m pytest            # backend, bot, API (offline)
-cd frontend && npm run lint && npm run typecheck && npm run build
+python -m pytest            # backend, bot, API, desktop sidecar (offline); extension e2e needs Playwright
+cd frontend && npm run lint && npm run typecheck && npm run build && npm run build:desktop
+cd desktop && npm test      # Electron shell helpers
+cd extension && npm test    # Chrome extension
 ```
 
 ---
+
+## Desktop app (Windows, macOS, Linux)
+
+`desktop/` is an installable app that runs the whole platform on your own computer: the bot, its API and the
+dashboard, with no Docker, Postgres or Redis. An Electron window shows the dashboard. A bundled Python server
+(`packaging/`, built with PyInstaller from `backend/desktop.py`) runs the API, the bot loop and SQLite on
+`http://127.0.0.1:47821` (the next free port if that one is busy).
+
+**Install.** Download the installer from the **Desktop app** workflow's artifacts, or from a GitHub release
+when a `v*` tag is pushed: `.exe` for Windows, `.dmg` for macOS (Apple silicon and Intel), `.AppImage` for Linux.
+Builds are unsigned unless signing secrets are configured, so the first launch needs one extra step:
+- Windows SmartScreen: **More info → Run anyway**.
+- macOS: **System Settings → Privacy & Security → Open Anyway**.
+- On Ubuntu 24.04+, start the AppImage with `--no-sandbox` or from its menu entry.
+
+**First run.** Register an account in the app: on the desktop the first account becomes the administrator and
+registration then closes. The bot starts **paused, in paper mode**. Open the Bot page, read the decisions, and
+press Start when you're ready.
+
+**Settings** live in `settings.env` in the data folder (tray menu → *Edit Settings*, then restart), e.g.
+`TRADING_MODE`, the Alpaca keys, `ANTHROPIC_API_KEY`, `LLM_REVIEW_ENABLED`, `BOT_UNIVERSE`, `ALERT_WEBHOOK_URL`.
+The database location and the JWT secret are managed by the app and can't be overridden there. Data folders:
+- Windows: `%APPDATA%\AI Trading Bot`
+- macOS: `~/Library/Application Support/AI Trading Bot`
+- Linux: `~/.local/share/ai-trading-bot`
+
+They hold `trading.db`, `secret.key`, `settings.env` and `logs/`.
+
+**Running in the background.** Closing the window keeps the bot running in the tray or menu bar. Use *Quit*
+to stop it: the server finishes an in-flight cycle first, which can take up to about 2.5 minutes. Paper-mode
+positions are only protected while the app runs, and the app warns you about this when you quit. Alpaca
+positions keep their broker-side stop-loss orders. The tray menu also has *Copy Server URL* (for the Chrome
+extension), *Open Data Folder*, *View Logs*, *Restart Bot Server*, *Start at Login* and *Keep computer awake*.
+
+**Forgot the password?**
+`tradebot-backend create-admin --email you@example.com --username admin`. The program sits in the app's
+resources `backend/` folder; from source, use `python -m backend.desktop create-admin …`.
+
+**Build it yourself.** Installers must be built on the target OS (CI does this on Windows, macOS arm64, macOS
+Intel and Linux runners):
+```bash
+cd frontend && npm ci && npm run build:desktop && cd ..        # static dashboard → frontend/out
+pip install -r packaging/requirements-desktop.txt
+python packaging/build_backend.py --smoke-test                 # → dist-backend/tradebot-backend/
+cd desktop && npm ci && npm test && npm run dist               # → desktop/dist/ (installer for this OS)
+npm run smoke                                                  # dev-mode end-to-end check
+```
+Optional signing secrets for `.github/workflows/desktop.yml`:
+- macOS: `CSC_LINK` and `CSC_KEY_PASSWORD`, plus `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD` and `APPLE_TEAM_ID`
+  for notarization.
+- Windows: `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD`.
+
+## Chrome extension
+
+`extension/` is a Manifest V3 companion (see [extension/README.md](extension/README.md)). It provides:
+- A toolbar badge with the bot's state (RUN, OFF, HALT, FLAT, DATA, LATE, DOWN), plus desktop notifications
+  when the bot halts, a flatten starts or finishes, or cycles fail.
+- A popup with equity, drawdown, open positions and recent decisions, and Start/Pause buttons.
+- A **panic flatten** button with a second confirmation step.
+- Ticker lookup: it detects the symbol from the page you're on (Yahoo Finance, Google Finance, TradingView,
+  NSE…) or takes a typed one, and shows the bot's analysis and the research scorecard.
+
+**Install:** open `chrome://extensions` → Developer mode → **Load unpacked** → select `extension/`.
+**Connect:** in its settings, use the desktop app (`http://127.0.0.1:47821`, or *Find the desktop app*) or your
+own HTTPS server (Chrome asks for that site's permission), then sign in. Bot status, alerts and controls need an
+admin account; ticker analysis works for any account.
+
+It reads no page content: only the active tab's URL, and only when you open the popup. Tokens stay in the
+extension's own storage. `cd extension && npm test` runs the unit tests; `node extension/scripts/pack.mjs`
+builds the Chrome Web Store zip.
 
 ## Bot API (`/api/bot`)
 

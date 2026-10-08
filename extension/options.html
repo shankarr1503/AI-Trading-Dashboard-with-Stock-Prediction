@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Trading Bot Companion: settings</title>
+  <link rel="stylesheet" href="base.css">
+  <link rel="stylesheet" href="options.css">
+  <script type="module" src="options.js"></script>
+</head>
+<body>
+  <main class="page">
+    <header class="page-head">
+      <img src="icons/icon48.png" width="40" height="40" alt="">
+      <div>
+        <h1>AI Trading Bot: Companion</h1>
+        <p class="hint">Watch and control your trading bot from the toolbar. <span id="status-line"></span></p>
+      </div>
+    </header>
+
+    <section class="card" aria-labelledby="server-h">
+      <h2 id="server-h">Server</h2>
+      <p class="lead">
+        The <strong>AI Trading Bot desktop app</strong> runs its server on this computer at
+        <code>http://127.0.0.1:47821</code>. If that port is busy it uses the next free one (up to 47841):
+        the app's tray menu shows the exact server URL, or press <em>Find the desktop app</em>. For a
+        self-hosted server (for example the Docker deployment), enter its <code>https://</code> address;
+        Chrome then asks you to allow access to that site.
+      </p>
+      <form id="server-form" class="stack" novalidate>
+        <label for="server-url">Server URL</label>
+        <input id="server-url" type="text" inputmode="url" spellcheck="false" autocomplete="off"
+               placeholder="http://127.0.0.1:47821">
+        <div class="actions">
+          <button id="server-save" class="btn primary" type="submit">Save</button>
+          <button id="server-test" class="btn" type="button">Test connection</button>
+          <button id="server-find" class="btn ghost" type="button">Find the desktop app</button>
+        </div>
+        <p id="server-msg" class="msg" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="account-h">
+      <h2 id="account-h">Account</h2>
+      <div id="signed-in" class="signed-in" hidden>
+        <p>Signed in to <span id="who-server" class="mono"></span> as <strong id="who"></strong> <span id="who-role" class="tag"></span></p>
+        <button id="sign-out" class="btn" type="button">Sign out</button>
+      </div>
+      <form id="login-form" class="stack" novalidate>
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="username" required>
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+        <div class="actions"><button id="sign-in" class="btn primary" type="submit">Sign in</button></div>
+      </form>
+      <p id="account-msg" class="msg" role="status" aria-live="polite"></p>
+      <p class="hint">
+        Use the account you created in the desktop app (its first account is the administrator). Bot status,
+        alerts and controls need an administrator; any account can analyse tickers. Your password is sent only
+        to the server above and is never stored: the extension keeps a refresh token in its local storage and a
+        short-lived access token in memory. Signing out removes both.
+      </p>
+    </section>
+
+    <section class="card" aria-labelledby="monitor-h">
+      <h2 id="monitor-h">Monitoring and alerts</h2>
+      <div class="row">
+        <label for="poll">Check the bot every</label>
+        <select id="poll" class="poll"></select>
+        <span>minute(s)</span>
+      </div>
+      <fieldset class="toggles">
+        <legend>Notify me when (once per change, not on every check):</legend>
+        <div id="notify-list"></div>
+      </fieldset>
+      <div class="actions">
+        <button id="test-notification" class="btn ghost" type="button">Send a test notification</button>
+      </div>
+      <p id="monitor-msg" class="msg" role="status" aria-live="polite"></p>
+      <p class="hint">Alerts need an administrator account. The badge on the toolbar icon shows the bot state:
+        RUN running, OFF paused, HALT halted, FLAT flatten pending, LATE no recent cycle, DATA data fault,
+        ERR failing cycles, DOWN server unreachable, ? not signed in.</p>
+    </section>
+
+    <section class="card" aria-labelledby="privacy-h">
+      <h2 id="privacy-h">Privacy</h2>
+      <p class="lead">
+        The extension never reads the content of the pages you visit and has no content scripts. When you open
+        its popup, it looks at the address of the current tab (and only that tab, only then) to recognise a ticker
+        on Yahoo Finance, Google Finance, TradingView, MarketWatch, Seeking Alpha, Finviz, CNBC, Nasdaq.com, NSE
+        or BSE. It talks only to the server configured above; nothing is sent anywhere else.
+      </p>
+    </section>
+  </main>
+</body>
+</html>

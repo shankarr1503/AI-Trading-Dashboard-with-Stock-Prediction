@@ -1,0 +1,241 @@
+# Desktop app: builds the dashboard export, the Python sidecar (PyInstaller) and the
+# Electron installers on each platform, smoke-tests both, and publishes the
+# installers on v* tags.
+#
+#   Windows x64      NSIS installer          (windows-latest)
+#   macOS arm64      DMG + zip               (macos-14)
+#   macOS x64        DMG + zip               (macos-15-intel: the macos-13 image is retired)
+#   Linux x64        AppImage                (ubuntu-latest)
+#
+# The sidecar is a native PyInstaller build, so every OS/architecture is built on
+# its own runner. Code signing is optional and only used when the secrets exist:
+#   macOS    CSC_LINK, CSC_KEY_PASSWORD (Developer ID Application .p12, base64) and, to
+#            notarize, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID.
+#            Without a certificate the app is ad-hoc signed (users must allow it in
+#            System Settings > Privacy & Security on first launch).
+#   Windows  WIN_CSC_LINK, WIN_CSC_KEY_PASSWORD (code-signing .pfx, base64). Unsigned
+#            otherwise (SmartScreen warns on first launch).
+# Pull requests never use the certificates.
+name: Desktop app
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "desktop/**"
+      - "packaging/**"
+      - "backend/**"
+      - "shared/**"
+      - "frontend/**"
+      - ".github/workflows/desktop.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "22"
+  NEXT_TELEMETRY_DISABLED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            platform: win
+            arch: x64
+            builder-args: --win nsis --x64
+            app: dist/win-unpacked/AI Trading Bot.exe
+          - name: macOS arm64
+            os: macos-14
+            platform: mac
+            arch: arm64
+            builder-args: --mac dmg zip --arm64
+            app: dist/mac-arm64/AI Trading Bot.app
+          - name: macOS x64
+            os: macos-15-intel
+            platform: mac
+            arch: x64
+            builder-args: --mac dmg zip --x64
+            app: dist/mac/AI Trading Bot.app
+          - name: Linux x64
+            os: ubuntu-latest
+            platform: linux
+            arch: x64
+            builder-args: --linux AppImage --x64
+            app: dist/linux-unpacked/ai-trading-bot
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: packaging/requirements-desktop.txt
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Check that the tag matches desktop/package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version="$(node -p "require('./desktop/package.json').version")"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match desktop/package.json version ${version}"
+            exit 1
+          fi
+
+      - name: Install the sidecar's Python dependencies
+        run: python -m pip install -r packaging/requirements-desktop.txt
+
+      - name: Build the dashboard (static export)
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build:desktop
+
+      # Builds dist-backend/tradebot-backend/ and smoke-tests the binary: start it on a
+      # temporary data dir, wait for TRADEBOT_READY, GET /health, POST
+      # /api/desktop/shutdown, expect exit code 0.
+      - name: Build and smoke-test the bot server (PyInstaller)
+        run: python packaging/build_backend.py --smoke-test
+
+      - name: Desktop unit tests
+        working-directory: desktop
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+      - name: Configure code signing
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          EVENT: ${{ github.event_name }}
+          SECRET_CSC_LINK: ${{ secrets.CSC_LINK }}
+          SECRET_CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          SECRET_APPLE_ID: ${{ secrets.APPLE_ID }}
+          SECRET_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          SECRET_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SECRET_WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          SECRET_WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          # Export a variable to the following steps (multi-line safe, never echoed).
+          put() {
+            local delimiter
+            delimiter="EOF_$(openssl rand -hex 12)"
+            { echo "$1<<${delimiter}"; echo "$2"; echo "${delimiter}"; } >> "$GITHUB_ENV"
+          }
+          put EXTRA_BUILDER_ARGS ""
+          if [ "$PLATFORM" = mac ]; then
+            if [ "$EVENT" != pull_request ] && [ -n "$SECRET_CSC_LINK" ]; then
+              put CSC_LINK "$SECRET_CSC_LINK"
+              put CSC_KEY_PASSWORD "$SECRET_CSC_KEY_PASSWORD"
+              if [ -n "$SECRET_APPLE_ID" ] && [ -n "$SECRET_APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$SECRET_APPLE_TEAM_ID" ]; then
+                put APPLE_ID "$SECRET_APPLE_ID"
+                put APPLE_APP_SPECIFIC_PASSWORD "$SECRET_APPLE_APP_SPECIFIC_PASSWORD"
+                put APPLE_TEAM_ID "$SECRET_APPLE_TEAM_ID"
+                echo "macOS: Developer ID signing and notarization"
+              else
+                echo "macOS: Developer ID signing, not notarized (APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID missing)"
+              fi
+            else
+              # Ad-hoc signature: consistent signatures over the app and the sidecar, which
+              # Apple silicon needs. It uses no secrets, so pull requests may do it too.
+              put CSC_IDENTITY_AUTO_DISCOVERY false
+              put CSC_FOR_PULL_REQUEST true
+              put EXTRA_BUILDER_ARGS "-c.mac.identity=-"
+              echo "macOS: no certificate, ad-hoc signed"
+            fi
+          elif [ "$PLATFORM" = win ]; then
+            if [ "$EVENT" != pull_request ] && [ -n "$SECRET_WIN_CSC_LINK" ]; then
+              put WIN_CSC_LINK "$SECRET_WIN_CSC_LINK"
+              put WIN_CSC_KEY_PASSWORD "$SECRET_WIN_CSC_KEY_PASSWORD"
+              echo "Windows: signed"
+            else
+              echo "Windows: unsigned"
+            fi
+          fi
+
+      - name: Package the desktop app (electron-builder)
+        working-directory: desktop
+        shell: bash
+        run: npx --no-install electron-builder ${{ matrix.builder-args }} --publish never ${EXTRA_BUILDER_ARGS:+"$EXTRA_BUILDER_ARGS"}
+
+      # The full app on a throwaway profile: start the sidecar, load the dashboard, check
+      # the window guards, quit through the graceful path; passes only if the sidecar
+      # exits 0 after "Shutdown requested (control API)".
+      - name: Smoke-test the packaged app (Linux, Xvfb)
+        if: matrix.platform == 'linux'
+        working-directory: desktop
+        env:
+          APP: ${{ matrix.app }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          # Ubuntu 24.04 blocks the unprivileged user namespaces Chromium's sandbox uses.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          xvfb-run -a node scripts/smoke.mjs --app "$APP"
+
+      - name: Smoke-test the packaged app (Windows, macOS)
+        if: matrix.platform != 'linux'
+        working-directory: desktop
+        shell: bash
+        env:
+          APP: ${{ matrix.app }}
+        run: node scripts/smoke.mjs --app "$APP"
+
+      - name: Upload the installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-trading-bot-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/*.dmg
+            desktop/dist/*.zip
+            desktop/dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: installers
+          pattern: ai-trading-bot-*
+          merge-multiple: true
+
+      - name: List the installers
+        run: ls -la installers
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: installers/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

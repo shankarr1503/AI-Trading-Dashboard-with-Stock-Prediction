@@ -1,0 +1,48 @@
+# Desktop sidecar (tradebot-backend, built with PyInstaller) - Python 3.11.
+#
+#   pip install -r packaging/requirements-desktop.txt
+#   python packaging/build_backend.py
+#
+# The backend's runtime requirements (backend/requirements.txt, same pins) minus
+# what only the server deployment needs:
+#   asyncpg            PostgreSQL driver: the desktop app uses SQLite (aiosqlite)
+#   redis              shared cache / rate-limit store: the desktop app keeps them in-process
+#   uvicorn[standard]  extras (uvloop, httptools, watchfiles, ...): the sidecar runs uvicorn
+#                      with loop="asyncio", http="h11", ws="websockets"
+# tests/test_desktop.py checks that these pins stay in step with backend/requirements.txt.
+
+# Web
+fastapi==0.115.6
+uvicorn==0.34.0
+h11==0.16.0
+websockets==17.2
+pydantic==2.10.4
+pydantic-settings==2.7.1
+email-validator==2.2.0
+slowapi==0.1.9
+
+# Auth
+PyJWT==2.10.1
+bcrypt==4.2.1
+
+# Database
+sqlalchemy==2.0.36
+alembic==1.14.0
+aiosqlite==0.20.0
+
+# HTTP
+httpx==0.28.1
+
+# Data
+yfinance==1.7.0
+pandas==2.2.3
+numpy>=1.26,<2.3
+# IANA time zones for zoneinfo: Windows has no system database.
+tzdata>=2024.1
+
+# Optional LLM risk reviewer / analyst (Claude)
+anthropic==1.11.0
+
+# Build
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
