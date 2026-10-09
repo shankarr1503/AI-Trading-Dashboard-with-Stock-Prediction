@@ -978,11 +978,14 @@ class TradingAgent:
             if abs(live - a.price) > scfg.gap_filter_atr * a.atr:
                 vetoes.append(f"Price {live:.2f} moved more than {scfg.gap_filter_atr} ATR from the signal close {a.price:.2f}")
             if fundamental and fundamental.get("available"):
-                if fundamental.get("altman_zone") == "distress":
+                # An uncorroborated Altman Z'' distress reading (profitable, cash-generative, interest
+                # covered; book equity shrunk by buybacks) is a research flag, not a veto.
+                if fundamental.get("altman_zone") == "distress" and fundamental.get("altman_distress_corroborated", True):
                     vetoes.append("Altman Z in the distress zone")
                 if fundamental.get("piotroski") is not None and fundamental["piotroski"] <= 2:
                     vetoes.append(f"Piotroski F-score {fundamental['piotroski']}/9")
-                vetoes.extend(self._earnings_vetoes(sym, fundamental, now))
+            # Runs whether or not fundamentals are available: it fails closed when they could not be fetched.
+            vetoes.extend(self._earnings_vetoes(sym, fundamental, now))
             if vetoes:
                 db.add(BotDecision(action="SKIP", reasons=vetoes + a.reasons, **base))
                 summary["skipped"] += 1
@@ -997,9 +1000,26 @@ class TradingAgent:
         return candidates
 
     @staticmethod
-    def _earnings_vetoes(sym: str, fundamental: dict, now) -> List[str]:
+    def _earnings_vetoes(sym: str, fundamental: Optional[dict], now) -> List[str]:
         n = settings.EARNINGS_BLACKOUT_DAYS
         if n <= 0:
+            return []
+        # Fail CLOSED, for the earnings blackout only. If the research view could not be obtained (None:
+        # the 30 s budget expired on a cold cache, or the call failed) or its fetch failed (`fetch_failed`:
+        # Yahoo down or rate limited), the next report date is unknown, so no entry is opened: an earnings
+        # gap can jump the stop. This does not outlast the outage: a cold-cache fetch keeps running in the
+        # background and is cached, a failed fetch is negatively cached for only
+        # research.service.TRANSIENT_FAILURE_TTL (2 min) and a snapshot whose calendar failed for
+        # DEGRADED_SNAPSHOT_TTL (10 min, under one cycle), so the first cycle after Yahoo recovers checks
+        # the real date. A view that is unavailable because Yahoo answered with no fundamentals at all
+        # (no `fetch_failed`, e.g. ETF-like instruments) has no earnings date to check and does not block.
+        # The Altman/Piotroski vetoes need data and are simply skipped when it is missing.
+        if fundamental is None:
+            return ["Earnings date unknown (fundamentals timed out or failed): blackout can't be checked"]
+        if not fundamental.get("available"):
+            if fundamental.get("fetch_failed") or fundamental.get("earnings_unknown"):
+                why = fundamental.get("reason") or "fundamentals fetch failed"
+                return [f"Earnings date unknown ({why}): blackout can't be checked"]
             return []
         if fundamental.get("earnings_unknown"):
             return ["Earnings date unknown (calendar fetch failed): blackout can't be checked"]

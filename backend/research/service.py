@@ -7,13 +7,20 @@ Fetch discipline (a snapshot is ~15 Yahoo requests):
   through asyncio.shield, so a caller's timeout never cancels (and so never
   wastes) the fetch, and the result is always cached when it lands;
 * failures are negatively cached, so a bad or unknown ticker is not re-fetched
-  on every request;
+  on every request. A fetch that FAILED (rate limit, outage, network: Yahoo
+  never answered) is cached for only TRANSIENT_FAILURE_TTL, so data — the
+  earnings date the bot's blackout needs above all — is back within minutes of
+  Yahoo recovering; "Yahoo answered and has no data" is cached for NEGATIVE_TTL.
+  (yfinance swallows HTTP errors, so an unknown ticker's empty answers look
+  like an outage's: those count as a failed fetch, retried after the short TTL);
 * a snapshot with a section that FAILED (rate limit, network) is cached briefly,
   so e.g. a missing earnings date is retried soon rather than in 12 hours;
 * `cached_fundamental_view` never fetches — for anonymous/public callers.
 
 Paid Claude reports run only when explicitly requested, one at a time per
 symbol, and a failed run backs off instead of re-running on every page view.
+A forced run shortly after another one finished returns that report instead
+(e.g. a retry after the browser gave up waiting on a run that completed).
 """
 from __future__ import annotations
 
@@ -34,18 +41,23 @@ from backend.database.session import as_utc, utcnow
 from backend.market_data.service import market_data_service, validate_symbol
 from backend.research import scorecard as sc
 from backend.research.analyst import ClaudeAnalyst, quant_report
-from backend.research.data import failed_sections, fetch_snapshot_sync
+from backend.research.data import SWALLOWED_ERRORS, failed_sections, fetch_snapshot_sync
 from backend.research.fundamentals import analyze_fundamentals
 from backend.research.valuation import value_company
 
 logger = logging.getLogger(__name__)
 
 SNAPSHOT_TTL = 12 * 3600
-DEGRADED_SNAPSHOT_TTL = 15 * 60     # a section failed: retry soon
-NEGATIVE_TTL = 30 * 60              # whole fetch failed / no data: don't hammer Yahoo
+# A section failed: retry soon. Shorter than the bot's default 15-minute cycle,
+# so the next cycle refetches: a failed calendar keeps the earnings blackout
+# closed (TradingAgent._earnings_vetoes) and must not outlast Yahoo's recovery.
+DEGRADED_SNAPSHOT_TTL = 10 * 60
+NEGATIVE_TTL = 30 * 60              # Yahoo answered with no data for the symbol: don't hammer Yahoo
+TRANSIENT_FAILURE_TTL = 2 * 60      # the fetch itself failed (outage, rate limit): retry within minutes
 DOSSIER_TTL = 3600
 FETCH_CONCURRENCY = 6
 LLM_FAILURE_BACKOFF = timedelta(hours=6)
+RECENT_LLM_REPORT_REUSE = timedelta(minutes=10)  # a forced Claude run this soon after one returns that one
 
 UNIVERSES: Dict[str, List[str]] = {
     "us_large_cap": [
@@ -59,6 +71,18 @@ UNIVERSES: Dict[str, List[str]] = {
         "HCLTECH.NS", "SUNPHARMA.NS", "TITAN.NS", "WIPRO.NS", "ULTRACEMCO.NS",
     ],
 }
+
+
+class SnapshotUnavailable(ValueError):
+    """
+    No usable snapshot. `transient` is True when the fetch failed (outage, rate
+    limit, network: the data is merely unknown right now) and False when Yahoo
+    answered and has no fundamentals for the symbol.
+    """
+
+    def __init__(self, message: str, transient: bool):
+        super().__init__(message)
+        self.transient = transient
 
 
 def _slim_snapshot(snap: Dict[str, Any]) -> Dict[str, Any]:
@@ -139,7 +163,11 @@ class ResearchService:
             return cached
         failure = await cache_get(_failure_key(symbol))
         if failure is not None:
-            raise ValueError(failure.get("error") or f"No fundamental data available for '{symbol}'")
+            msg = failure.get("error") or f"No fundamental data available for '{symbol}'"
+            transient = failure.get("transient")
+            if transient is None:  # entry cached before the flag existed
+                transient = msg.startswith("Fundamental data fetch failed")
+            raise SnapshotUnavailable(msg, bool(transient))
         self._loop_state()
         task = self._inflight.get(symbol)
         if task is None:
@@ -156,18 +184,42 @@ class ResearchService:
         if not task.cancelled():
             task.exception()  # mark retrieved: callers that timed out never will
 
+    async def _remember_failure(self, symbol: str, msg: str, transient: bool) -> None:
+        ttl = TRANSIENT_FAILURE_TTL if transient else NEGATIVE_TTL
+        logger.info("Research snapshot for %s failed (%s; cached %ss): %s",
+                    symbol, "transient" if transient else "no data", ttl, msg)
+        await cache_set(_failure_key(symbol), {"error": msg, "transient": transient}, ttl)
+
     async def _fetch_snapshot(self, symbol: str) -> Dict[str, Any]:
         try:
             async with self._fetch_sem:
                 snap = await asyncio.to_thread(self.snapshot_fetcher, symbol)
-            if not snap.get("market", {}).get("price") and not snap.get("statements", {}).get("annual", {}).get("income"):
-                raise ValueError(f"No fundamental data available for '{symbol}'")
         except Exception as e:  # noqa: BLE001 - every failure is negatively cached
-            msg = str(e) if isinstance(e, ValueError) else f"Fundamental data fetch failed for '{symbol}' ({type(e).__name__})"
-            logger.info("Research snapshot for %s failed: %s", symbol, msg)
-            await cache_set(_failure_key(symbol), {"error": msg}, NEGATIVE_TTL)
-            raise ValueError(msg) from e
+            # A ValueError from the fetcher means "no such data"; anything else
+            # (rate limit, network, a library error) is a failed fetch.
+            transient = not isinstance(e, ValueError)
+            msg = f"Fundamental data fetch failed for '{symbol}' ({type(e).__name__})" if transient else str(e)
+            await self._remember_failure(symbol, msg, transient)
+            raise SnapshotUnavailable(msg, transient) from e
         failed = failed_sections(snap)
+        if not snap.get("market", {}).get("price") and not snap.get("statements", {}).get("annual", {}).get("income"):
+            # Nothing usable. If sections errored, Yahoo did not answer (every
+            # section failing is what an outage or rate limit looks like): that
+            # says nothing about whether data exists, so retry soon.
+            # When the only failures are empty answers (swallowed HTTP errors), an
+            # unknown symbol looks the same: still retried soon (and the bot's
+            # blackout stays closed), but the message says it may be either.
+            errors = {str(e.get("error")) for e in snap.get("fetch_errors") or [] if isinstance(e, dict)}
+            if failed and errors and errors <= set(SWALLOWED_ERRORS):
+                msg = f"No data returned for '{symbol}': the symbol may not exist, or Yahoo may be failing"
+            elif failed:
+                names = list(dict.fromkeys(failed))
+                msg = (f"Fundamental data fetch failed for '{symbol}' "
+                       f"({', '.join(names[:3])}{' …' if len(names) > 3 else ''} failed)")
+            else:
+                msg = f"No fundamental data available for '{symbol}'"
+            await self._remember_failure(symbol, msg, transient=bool(failed))
+            raise SnapshotUnavailable(msg, transient=bool(failed))
         if failed:
             logger.info("Research snapshot for %s is degraded (%s); caching for %ss", symbol, failed, DEGRADED_SNAPSHOT_TTL)
         await cache_set(_snapshot_key(symbol), snap, DEGRADED_SNAPSHOT_TTL if failed else SNAPSHOT_TTL)
@@ -250,6 +302,9 @@ class ResearchService:
             "coverage": d["scorecard"].get("coverage"),
             "altman_zone": altman.get("zone"),
             "altman_model": altman.get("model"),
+            # False for a Z'' distress reading no other signal backs (see fundamentals.distress_evidence):
+            # reported, but not a bot veto.
+            "altman_distress_corroborated": altman.get("distress_corroborated", altman.get("zone") == "distress"),
             "piotroski": (f.get("piotroski") or {}).get("score"),
             "flags": f.get("flags", []),
             "fair_value": v.get("fair_value"),
@@ -266,11 +321,22 @@ class ResearchService:
         }
 
     async def fundamental_view(self, symbol: str) -> Dict[str, Any]:
-        """Compact view used by the trading bot (cached, never raises; may fetch)."""
+        """
+        Compact view used by the trading bot (cached, never raises; may fetch).
+
+        Unavailable views say why: `fetch_failed` (and `earnings_unknown`) when
+        the data could not be fetched — the bot then fails CLOSED on its earnings
+        blackout — versus Yahoo having no fundamentals for the symbol at all.
+        """
         try:
             d = await self.dossier(symbol)
-        except Exception as e:
-            return {"available": False, "reason": str(e)}
+        except SnapshotUnavailable as e:
+            if not e.transient:
+                return {"available": False, "reason": str(e), "fetch_failed": False}
+            return {"available": False, "reason": str(e), "fetch_failed": True, "earnings_unknown": True}
+        except Exception as e:  # anything unexpected: the data (and earnings date) is unknown
+            return {"available": False, "reason": f"Fundamentals unavailable ({type(e).__name__}: {e})",
+                    "fetch_failed": True, "earnings_unknown": True}
         return self._view(d)
 
     async def cached_fundamental_view(self, symbol: str) -> Dict[str, Any]:
@@ -315,7 +381,7 @@ class ResearchService:
         return False
 
     async def report(self, db: AsyncSession, symbol: str, allow_llm: bool, refresh: bool = False,
-                     user_id: Optional[int] = None) -> Dict[str, Any]:
+                     user_id: Optional[int] = None, force: bool = False) -> Dict[str, Any]:
         """
         Return a fresh-enough stored report, or generate one.
 
@@ -325,6 +391,9 @@ class ResearchService:
         backoff window is not retried automatically. `refresh` forces a new
         report (and overrides the backoff). Concurrent Claude runs for one
         symbol are de-duplicated: waiters get the report the first run produced.
+        A refresh within RECENT_LLM_REPORT_REUSE of a stored Claude report
+        returns that report (flagged `reused_recent`) unless `force`: a paid run
+        outlives a client that stopped waiting, and retrying must not pay twice.
         """
         symbol = validate_symbol(symbol)
         max_age = timedelta(hours=settings.RESEARCH_REPORT_MAX_AGE_HOURS)
@@ -349,6 +418,10 @@ class ResearchService:
             recent = self._llm_recent.get(symbol)
             if recent and recent[0] >= requested:
                 return recent[1]  # a concurrent request for this symbol just produced a report
+            if refresh and not force:
+                just_made = await self._fresh_report(db, symbol, "claude", RECENT_LLM_REPORT_REUSE)
+                if just_made:
+                    return {**self._serialize(just_made), "reused_recent": True}
             if not refresh:
                 existing = await self._fresh_report(db, symbol, "claude", max_age)
                 if existing:
@@ -448,6 +521,7 @@ class ResearchService:
                     "piotroski": (f.get("piotroski") or {}).get("score"),
                     "altman_zone": (f.get("altman") or {}).get("zone"),
                     "altman_model": (f.get("altman") or {}).get("model"),
+                    "altman_distress_corroborated": (f.get("altman") or {}).get("distress_corroborated"),
                     "flags": f.get("flags", []),
                     "technical_signal": d["technical"].get("signal"),
                 }

@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.research.data import failed_sections
+
 DEFAULT_TAX_RATE = 0.21
 
 # ─── Business-model classification ────────────────────────────────────────────
@@ -29,21 +31,48 @@ BALANCE_SHEET_INDUSTRIES = (
     "banks", "insurance", "capital markets", "mortgage finance", "thrifts", "savings",
     "financial conglomerates", "diversified financial", "reit mortgage", "mortgage reit", "shell companies",
 )
+# Fee businesses that never lend or underwrite: exchanges / clearing houses,
+# data and ratings vendors, insurance brokers. Their balance sheets are
+# grossed up by client money — clearing margin and guaranty funds (CME ~22x
+# revenue, ICE ~12x), fiduciary funds (brokers) — matched by equal
+# liabilities, plus acquisition goodwill (S&P Global). Book value does not
+# anchor them, so they are always valued as operating businesses.
+FEE_BUSINESS_INDUSTRIES = ("financial data", "financial exchanges", "insurance brokers")
 # Financial industries that contain both asset-light businesses (payment
-# networks, exchanges, data vendors, brokers, traditional fund managers) and
-# lenders / consolidated-fund vehicles: decided by the balance-sheet test.
+# networks, traditional fund managers) and lenders / consolidated-insurer or
+# fund vehicles (card lenders, BDCs, alternative managers that consolidate an
+# insurer): decided by the balance-sheet test below.
 ASSET_LIGHT_CANDIDATE_INDUSTRIES = (
     "credit services", "consumer finance", "transaction payment processing", "asset management",
-    "financial data", "financial exchanges", "insurance brokers",
 )
-# Asset-light test: a lender carries its loan book on the balance sheet, so its
-# total assets are many times revenue (banks ~10x+, card lenders ~5x); payment
-# networks and fee businesses sit around 1-3x. Must also generate positive FCF.
+# Balance-sheet test, on TANGIBLE assets (goodwill and acquired intangibles
+# are not a loan book). A lender carries its loans on the balance sheet, so
+# tangible assets are many times revenue (banks ~10x+, card lenders ~4-5x:
+# American Express is a deposit-funded card lender and gets the bank model);
+# payment networks sit around 1-3x. Fund managers carry separate-account assets
+# and consolidated funds matched by liabilities (BlackRock ~4-5x tangible),
+# while lenders filed under asset management — BDCs (assets ~1/yield ≈ 8-9x
+# revenue), trust banks and insurer-consolidating alternative managers (15x+) —
+# sit far higher, hence a separate threshold. Positive FCF is also required.
 ASSET_LIGHT_MAX_ASSETS_TO_REVENUE = 3.0
+ASSET_MANAGER_MAX_ASSETS_TO_REVENUE = 6.0
+# A reported loan book this large (share of total assets) means a lender, whatever the ratios say.
+LOAN_BOOK_MIN_SHARE_OF_ASSETS = 0.25
 
 
 def _norm_text(s: Optional[str]) -> str:
     return re.sub(r"[^a-z]+", " ", str(s or "").lower()).strip()
+
+
+def tangible_assets(latest: Dict[str, float]) -> Optional[float]:
+    """Total assets less goodwill and other intangibles (when reported)."""
+    ta = latest.get("total_assets")
+    if ta is None:
+        return None
+    intangibles = latest.get("goodwill_intangibles")
+    if intangibles is None:
+        intangibles = (latest.get("goodwill") or 0.0) + (latest.get("other_intangibles") or 0.0)
+    return max(ta - max(intangibles, 0.0), 0.0)
 
 
 def classify_business(sector: str, industry: str, latest: Dict[str, float]) -> Dict[str, Any]:
@@ -53,19 +82,30 @@ def classify_business(sector: str, industry: str, latest: Dict[str, float]) -> D
     """
     ind = _norm_text(industry)
 
-    def asset_light_test(label: str) -> Dict[str, Any]:
+    def asset_light_test(label: str, max_intensity: float = ASSET_LIGHT_MAX_ASSETS_TO_REVENUE) -> Dict[str, Any]:
         ta, rev = latest.get("total_assets"), latest.get("revenue")
         fcf = latest.get("fcf")
-        intensity = _div(ta, rev) if rev and rev > 0 else None
-        if intensity is not None and intensity <= ASSET_LIGHT_MAX_ASSETS_TO_REVENUE and fcf is not None and fcf > 0:
+        loans = latest.get("net_loans")
+        if loans and ta and ta > 0 and loans / ta >= LOAN_BOOK_MIN_SHARE_OF_ASSETS:
+            return {"type": "balance_sheet_financial", "is_financial": True,
+                    "reason": f"{label}: lender (loan book {loans / ta:.0%} of assets) — bank-style model"}
+        tangible = tangible_assets(latest)
+        intensity = _div(tangible, rev) if rev and rev > 0 else None
+        if intensity is not None and intensity <= max_intensity and fcf is not None and fcf > 0:
             return {"type": "asset_light_financial", "is_financial": False,
-                    "reason": f"{label}: asset-light (assets {intensity:.1f}x revenue, positive FCF) — valued as an "
-                              f"operating business"}
-        detail = f"assets {intensity:.1f}x revenue" if intensity is not None else "assets/revenue unavailable"
+                    "reason": f"{label}: asset-light (tangible assets {intensity:.1f}x revenue, positive FCF) — "
+                              f"valued as an operating business"}
+        detail = f"tangible assets {intensity:.1f}x revenue" if intensity is not None else "assets/revenue unavailable"
         return {"type": "balance_sheet_financial", "is_financial": True,
                 "reason": f"{label}: balance-sheet intensive ({detail}"
                           f"{'' if fcf is not None and fcf > 0 else ', no positive FCF'}) — bank-style model"}
 
+    if any(ind.startswith(p) for p in FEE_BUSINESS_INDUSTRIES):
+        return {"type": "asset_light_financial", "is_financial": False,
+                "reason": f"Industry '{industry}': fee business (exchange, data vendor or broker; client money on its "
+                          f"balance sheet is matched by liabilities) — valued as an operating business"}
+    if ind.startswith("asset management"):
+        return asset_light_test(f"Industry '{industry}'", ASSET_MANAGER_MAX_ASSETS_TO_REVENUE)
     if any(ind.startswith(p) for p in ASSET_LIGHT_CANDIDATE_INDUSTRIES):
         return asset_light_test(f"Industry '{industry}'")
     if any(ind.startswith(p) for p in BALANCE_SHEET_INDUSTRIES):
@@ -76,6 +116,11 @@ def classify_business(sector: str, industry: str, latest: Dict[str, float]) -> D
     return {"type": "operating", "is_financial": False, "reason": "Operating company"}
 
 
+def profile_unknown(snapshot: Dict[str, Any]) -> bool:
+    """The company profile (`info`: sector, industry, reporting currency) failed to load."""
+    return "info" in failed_sections(snapshot)
+
+
 def currency_info(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """
     Trading (price) vs reporting (statement) currency. A mismatch (ADRs such as
@@ -83,12 +128,25 @@ def currency_info(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     statements) makes every ratio mixing price with statement figures
     meaningless without FX conversion, which is not done offline. Compared
     case-sensitively on purpose: "GBp" (pence) is not "GBP".
+
+    `unknown`: either currency could not be established (the profile fetch
+    failed): price and statements are then just as incomparable as on a known
+    mismatch. `comparable` is the one flag valuation code should test.
     """
     profile = snapshot.get("profile") or {}
     trading = profile.get("trading_currency")
     financial = profile.get("financial_currency")
-    return {"trading": trading, "financial": financial,
-            "mismatch": bool(trading and financial and trading != financial)}
+    mismatch = bool(trading and financial and trading != financial)
+    unknown = not mismatch and (not trading or not financial or profile_unknown(snapshot))
+    return {"trading": trading, "financial": financial, "mismatch": mismatch, "unknown": unknown,
+            "comparable": not (mismatch or unknown)}
+
+
+def currencies_comparable(currency: Dict[str, Any]) -> bool:
+    """Back-compatible read of currency_info (cached dossiers predate `comparable`)."""
+    if "comparable" in currency:
+        return bool(currency["comparable"])
+    return not currency.get("mismatch")
 
 
 # ─── Altman Z model selection ─────────────────────────────────────────────────
@@ -128,6 +186,33 @@ ALTMAN_MODELS = {
 }
 
 
+# Z'' (no market-value term) leans on book equity and working capital, which
+# buybacks and negative-working-capital business models shrink: an investment-
+# grade buyback-heavy company (e.g. Oracle) can score "distress" while
+# profitable and well covered. A Z'' distress reading therefore counts as
+# distress (SELL cap, bot veto) only when corroborated by independent signs of
+# trouble; otherwise it is reported as an uncorroborated flag.
+DISTRESS_MIN_INTEREST_COVERAGE = 1.5
+DISTRESS_NEGATIVE_EQUITY_MIN_COVERAGE = 3.0
+
+
+def distress_evidence(latest: Dict[str, float]) -> List[str]:
+    """Independent distress signals: operating losses, cash burn, weak interest coverage."""
+    out: List[str] = []
+    ebit, interest = latest.get("ebit"), latest.get("interest_expense")
+    equity, cfo = latest.get("equity"), latest.get("operating_cf")
+    coverage = _div(ebit, abs(interest)) if interest else None
+    if ebit is not None and ebit <= 0:
+        out.append("operating loss")
+    if cfo is not None and cfo <= 0:
+        out.append("negative operating cash flow")
+    if coverage is not None and coverage < DISTRESS_MIN_INTEREST_COVERAGE:
+        out.append(f"interest coverage {coverage:.1f}x")
+    elif equity is not None and equity <= 0 and coverage is not None and coverage < DISTRESS_NEGATIVE_EQUITY_MIN_COVERAGE:
+        out.append(f"negative book equity with interest coverage {coverage:.1f}x")
+    return out
+
+
 def altman_model_for(sector: str, industry: str, is_financial: bool) -> Tuple[Optional[str], str]:
     ind = _norm_text(industry)
     if is_financial:
@@ -146,17 +231,63 @@ def effective_tax_rate(row: Dict[str, float]) -> float:
     return min(max(r, 0.0), 0.35) if r is not None else DEFAULT_TAX_RATE
 
 
-def fcff(row: Dict[str, float]) -> Optional[float]:
+INDIA_SUFFIXES = (".NS", ".BO")
+
+
+def cash_flow_basis(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Free cash flow to the firm: levered FCF (CFO − capex, which is after interest)
-    plus after-tax interest expense. This is the cash flow a WACC-discounted,
-    enterprise-value DCF must use before net debt is subtracted.
+    Default for where interest paid sits in the cash-flow statement, from the
+    filing standard. US GAAP (ASC 230) puts it in operating cash flow. Ind AS 7
+    (India: .NS/.BO listings, country India, INR statements) requires
+    non-financial companies to classify it as FINANCING, so their reported CFO
+    is already before interest. Other IFRS filers may choose either; without
+    the reported InterestPaidCFO/CFF rows the US convention is assumed. The
+    rows, when Yahoo reports them, override this per period (see fcff).
+    """
+    profile = snapshot.get("profile") or {}
+    symbol = str(snapshot.get("symbol") or "").upper()
+    india = (symbol.endswith(INDIA_SUFFIXES) or str(profile.get("country") or "").strip().lower() == "india"
+             or profile.get("financial_currency") == "INR")
+    if india:
+        return {"interest_in_operating_cf": False,
+                "note": "Ind AS 7 filer: interest paid is a financing cash flow, so operating cash flow is already "
+                        "before interest"}
+    return {"interest_in_operating_cf": True,
+            "note": "Interest paid taken as inside operating cash flow (US GAAP convention)"}
+
+
+def interest_in_cfo(row: Dict[str, float], default: bool) -> bool:
+    """A reported InterestPaidCFF / InterestPaidCFO row decides for its period; otherwise `default`."""
+    if row.get("interest_paid_cff"):
+        return False
+    if row.get("interest_paid_cfo"):
+        return True
+    return default
+
+
+def fcff(row: Dict[str, float], interest_in_operating_cf: bool = True) -> Optional[float]:
+    """
+    Free cash flow to the firm: CFO before interest − capex − the interest tax
+    shield (the WACC's after-tax cost of debt already credits the shield). This
+    is the cash flow a WACC-discounted, enterprise-value DCF must use before
+    net debt is subtracted.
+
+    * Interest paid inside CFO (US GAAP): levered FCF + interest × (1 − t).
+    * Interest paid in financing (Ind AS 7, IFRS option): CFO is already before
+      interest, so FCF − interest × t; adding the interest back again would
+      count it twice. A reported InterestPaidCFF / InterestPaidCFO row decides
+      for that period; otherwise `interest_in_operating_cf` (cash_flow_basis).
     """
     fcf = row.get("fcf")
     if fcf is None:
         return None
     interest = row.get("interest_expense")
-    return fcf + abs(interest) * (1 - effective_tax_rate(row)) if interest else fcf
+    if not interest:
+        return fcf
+    t = effective_tax_rate(row)
+    if interest_in_cfo(row, interest_in_operating_cf):
+        return fcf + abs(interest) * (1 - t)
+    return fcf - abs(interest) * t
 
 
 def _series(statements: Dict[str, Dict[str, float]], item: str) -> List[Optional[float]]:
@@ -282,7 +413,19 @@ def altman_z(latest: Dict[str, float], market_cap: Optional[float], sector: str,
     else:
         z = 6.56 * wc / ta + 3.26 * re_ / ta + 6.72 * ebit / ta + 1.05 * book / tl
     zone = "safe" if z > spec["safe"] else "grey" if z >= spec["distress"] else "distress"
-    return {"z": round(z, 3), "zone": zone, **base}
+    out = {"z": round(z, 3), "zone": zone, **base}
+    if zone == "distress":
+        if model == "z_double_prime":
+            evidence = distress_evidence(latest)
+            out["distress_corroborated"] = bool(evidence)
+            out["distress_evidence"] = evidence
+            if not evidence:
+                out["note"] += ("; distress reading not corroborated (no operating loss, negative operating cash flow "
+                                "or weak interest coverage): Z'' has no market-value term, so book equity shrunk by "
+                                "buybacks can depress it on its own — treated as a flag, not as distress")
+        else:
+            out["distress_corroborated"] = True
+    return out
 
 
 def analyze_fundamentals(snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -293,13 +436,27 @@ def analyze_fundamentals(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     sector = profile.get("sector", "") or ""
     industry = profile.get("industry", "") or ""
     currency = currency_info(snapshot)
+    comparable = currencies_comparable(currency)
     if not keys:
         return {"available": False, "periods": [], "reason": "No annual statements available",
                 "currency": currency}
 
     latest = periods[keys[-1]]
     prev = periods[keys[-2]] if len(keys) >= 2 else {}
-    business = classify_business(sector, industry, latest)
+    if profile_unknown(snapshot):
+        # Sector/industry are blank because the profile fetch failed, not because
+        # the company has none: "operating" would put a bank through a DCF.
+        business = {"type": "unknown", "is_financial": False,
+                    "reason": "Company profile (sector/industry) failed to load: business model unknown"}
+    else:
+        business = classify_business(sector, industry, latest)
+    basis = cash_flow_basis(snapshot)
+    in_cfo = basis["interest_in_operating_cf"]
+    if latest.get("interest_paid_cff") or latest.get("interest_paid_cfo"):
+        # The latest filing says where interest paid sits: report that (it also decides that period's FCFF).
+        reported = interest_in_cfo(latest, in_cfo)
+        basis = {"interest_in_operating_cf": reported,
+                 "note": f"Interest paid reported in {'operating' if reported else 'financing'} cash flow"}
 
     def s(item):
         return _series(periods, item)
@@ -315,7 +472,7 @@ def analyze_fundamentals(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     net_debt = (latest.get("total_debt") or 0) - (latest.get("cash") or 0) if latest.get("total_debt") is not None else None
     market_cap = market.get("market_cap")
     shareholder_return = None
-    if market_cap and not currency["mismatch"]:  # never divide statement cash flows by a foreign-currency cap
+    if market_cap and comparable:  # never divide statement cash flows by a foreign/unknown-currency cap
         paid = -(latest.get("dividends_paid") or 0) - (latest.get("buybacks") or 0)
         shareholder_return = paid / market_cap
 
@@ -339,7 +496,7 @@ def analyze_fundamentals(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         "eps_growth_yoy": (_div(latest.get("diluted_eps"), prev.get("diluted_eps")) - 1)
         if prev.get("diluted_eps") and prev["diluted_eps"] > 0 and latest.get("diluted_eps") is not None else None,
         "fcf": _last(fcf),
-        "fcff": fcff(latest),
+        "fcff": fcff(latest, in_cfo),
         "fcf_cagr": _cagr(fcf[0], fcf[-1], n_years),
         "gross_margin": gross_margins[-1],
         "operating_margin": op_margins[-1],
@@ -369,7 +526,7 @@ def analyze_fundamentals(snapshot: Dict[str, Any]) -> Dict[str, Any]:
             "revenue": periods[k].get("revenue"),
             "net_income": periods[k].get("net_income"),
             "fcf": periods[k].get("fcf"),
-            "fcff": fcff(periods[k]),
+            "fcff": fcff(periods[k], in_cfo),
             "interest_expense": periods[k].get("interest_expense"),
             "gross_margin": gross_margins[i],
             "operating_margin": op_margins[i],
@@ -394,10 +551,19 @@ def analyze_fundamentals(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         flags.append(f"Revenue declining {metrics['revenue_growth_yoy']:.1%} YoY")
 
     piotroski = piotroski_f_score(periods)
-    altman = altman_z(latest, market_cap, sector, industry, is_financial=business["is_financial"],
-                      market_cap_comparable=not currency["mismatch"])
+    if business["type"] == "unknown":
+        altman = {"z": None, "zone": "insufficient_data", "model": None,
+                  "note": "Business model unknown (company profile failed to load): Altman model not chosen"}
+    else:
+        altman = altman_z(latest, market_cap, sector, industry, is_financial=business["is_financial"],
+                          market_cap_comparable=comparable)
     if altman.get("zone") == "distress":
-        flags.append(f"{ALTMAN_MODELS[altman['model']]['name'].split(' (')[0]} {altman['z']} in distress zone")
+        name = f"{ALTMAN_MODELS[altman['model']]['name'].split(' (')[0]} {altman['z']} in distress zone"
+        if altman.get("distress_corroborated", True):
+            flags.append(name)
+        else:
+            flags.append(f"{name}, not corroborated (no operating loss, cash burn or weak interest coverage): "
+                         f"likely buyback-depleted book equity")
     if piotroski.get("score") is not None and piotroski["score"] <= 2:
         flags.append(f"Weak Piotroski F-score ({piotroski['score']}/9)")
 
@@ -408,6 +574,7 @@ def analyze_fundamentals(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         "is_financial": business["is_financial"],
         "business_model": business,
         "currency": currency,
+        "cash_flow_basis": basis,
         "metrics": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in metrics.items()},
         "history": history,
         "piotroski": piotroski,

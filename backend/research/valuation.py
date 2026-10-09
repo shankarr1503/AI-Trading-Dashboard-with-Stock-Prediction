@@ -2,9 +2,10 @@
 Valuation: trading multiples, cost of capital, scenario DCF, reverse DCF and
 (for banks/insurers) a justified price-to-book model.
 
-The DCF discounts free cash flow to the FIRM (levered FCF + after-tax interest)
-at WACC to an enterprise value, then subtracts net debt — discounting levered
-FCF at WACC and subtracting debt again would count the debt twice.
+The DCF discounts free cash flow to the FIRM (FCF before interest, net of the
+interest tax shield; see fundamentals.fcff) at WACC to an enterprise value, then
+subtracts net debt — discounting levered FCF at WACC and subtracting debt again
+would count the debt twice.
 
 These are models, not oracles: every output carries its assumptions so a
 reader (or the analyst agent) can judge them.
@@ -103,14 +104,17 @@ def value_company(snapshot: Dict[str, Any], fundamentals: Dict[str, Any]) -> Dic
     price = _num(market.get("price"))
     market_cap = _num(market.get("market_cap"))
     m = fundamentals.get("metrics", {}) if fundamentals.get("available") else {}
-    from backend.research.fundamentals import currency_info, merge_annual
+    from backend.research.fundamentals import currencies_comparable, currency_info, merge_annual
 
     latest = {}
     if fundamentals.get("available"):
         periods = merge_annual(snapshot)
         latest = periods[sorted(periods)[-1]]
     currency = fundamentals.get("currency") or currency_info(snapshot)
-    mismatch = bool(currency.get("mismatch"))
+    # Not comparable: a known mismatch (ADR) or an unknown reporting currency
+    # (profile fetch failed) — either way price and statements can't be mixed.
+    mismatch = not currencies_comparable(currency)
+    business_type = (fundamentals.get("business_model") or {}).get("type")
 
     total_debt = _num(latest.get("total_debt")) or _num(info.get("totalDebt"))
     cash = _num(latest.get("cash")) or _num(info.get("totalCash"))
@@ -147,9 +151,13 @@ def value_company(snapshot: Dict[str, Any], fundamentals: Dict[str, Any]) -> Dic
         # another currency (and often per ordinary share). Without FX conversion
         # every price-vs-fundamentals ratio is meaningless, so report none.
         multiples.update({k: None for k in PRICE_MULTIPLES})
-        warnings.append(f"Financial statements are reported in {currency.get('financial')} but the stock trades in "
-                        f"{currency.get('trading')}: price multiples and intrinsic value are not computed "
-                        f"(no FX conversion)")
+        if currency.get("mismatch"):
+            warnings.append(f"Financial statements are reported in {currency.get('financial')} but the stock trades "
+                            f"in {currency.get('trading')}: price multiples and intrinsic value are not computed "
+                            f"(no FX conversion)")
+        else:
+            warnings.append("Reporting currency unknown (company profile failed to load): price multiples and "
+                            "intrinsic value are not computed")
 
     tax_rate = m.get("tax_rate") if m.get("tax_rate") is not None else 0.21
     # Capital-structure weights would mix currencies too: fall back to equity-only.
@@ -159,7 +167,7 @@ def value_company(snapshot: Dict[str, Any], fundamentals: Dict[str, Any]) -> Dic
 
     assumptions: List[str] = [
         f"Risk-free {RISK_FREE:.2%}, equity risk premium {EQUITY_RISK_PREMIUM:.1%}, beta {coc['beta_used']}",
-        f"WACC {wacc:.2%} (clamped to 6–14%)" + (" — equity-only weights (currency mismatch)" if mismatch else ""),
+        f"WACC {wacc:.2%} (clamped to 6–14%)" + (" — equity-only weights (currencies not comparable)" if mismatch else ""),
     ]
     scenarios: Dict[str, Dict[str, Any]] = {}
     method = "none"
@@ -180,6 +188,8 @@ def value_company(snapshot: Dict[str, Any], fundamentals: Dict[str, Any]) -> Dic
     fcff_base = None
     if mismatch:
         pass  # warned above: no intrinsic value across currencies
+    elif business_type == "unknown":
+        warnings.append("Business model unknown (company profile failed to load): no intrinsic value")
     elif fundamentals.get("is_financial"):
         roe = m.get("roe")
         coe = coc["cost_of_equity"]
@@ -220,8 +230,13 @@ def value_company(snapshot: Dict[str, Any], fundamentals: Dict[str, Any]) -> Dic
                 scenarios[name] = {"value": round(per_share, 2), "growth": round(g, 4), "terminal_growth": tg,
                                    "wacc": round(w, 4), "probability": SCENARIO_PROBS[name]}
             implied = implied_growth(ev, fcff_base, 0.025, wacc)
-            assumptions.append(f"Normalised FCFF {fcff_base:,.0f} (levered FCF + after-tax interest; blend of latest "
-                               f"and 3-year average), discounted at WACC, less net debt {net_debt:,.0f}")
+            basis = fundamentals.get("cash_flow_basis") or {"interest_in_operating_cf": True}
+            how = ("levered FCF + after-tax interest" if basis.get("interest_in_operating_cf")
+                   else "FCF less the interest tax shield: interest paid is a financing cash flow")
+            assumptions.append(f"Normalised FCFF {fcff_base:,.0f} ({how}; blend of latest and 3-year average), "
+                               f"discounted at WACC, less net debt {net_debt:,.0f}")
+            if basis.get("note"):
+                assumptions.append(f"Cash-flow basis: {basis['note']}")
             if latest.get("interest_expense") is None and (total_debt or 0) > 0:
                 assumptions.append("Interest expense not reported: FCFF taken as levered FCF (conservative)")
         else:

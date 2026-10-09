@@ -463,6 +463,71 @@ async def test_earnings_blackout_covers_unconfirmed_window_and_unknown_dates(db_
     assert "gap-risk blackout" in text and "Earnings date unknown" in text
 
 
+async def test_earnings_blackout_fails_closed_when_fundamentals_cannot_be_fetched(db_tables, market):
+    """R1: a failed or timed-out research fetch leaves the earnings date unknown: no entry (only for that check)."""
+    far = (datetime.now(timezone.utc).date() + timedelta(days=60)).isoformat()
+
+    class Research(FakeResearch):
+        async def fundamental_view(self, symbol):
+            view = self.views.get(symbol, {"available": False})
+            if isinstance(view, Exception):
+                raise view                             # e.g. the 30 s budget expiring on a cold cache
+            return view
+
+    research = Research({
+        "AAA": {"available": False, "fetch_failed": True, "earnings_unknown": True,
+                "reason": "Fundamental data fetch failed for 'AAA' (YFRateLimitError)"},
+        "BBB": TimeoutError(),
+    })
+    agent = agent_for(market, research=research)
+    summary = await agent.run_cycle(force=True)
+    assert not {"AAA", "BBB"} & {e["symbol"] for e in summary["entries"]}
+    reasons = {d.symbol: " ".join(d.reasons or []) for d in await rows(BotDecision) if d.action == "SKIP"}
+    assert "Earnings date unknown" in reasons["AAA"] and "YFRateLimitError" in reasons["AAA"]
+    assert "Earnings date unknown" in reasons["BBB"] and "timed out" in reasons["BBB"]
+
+    # Yahoo is back: the real date is checked, and a symbol Yahoo has no fundamentals for at all
+    # (no `fetch_failed`, e.g. an ETF) has no earnings date to wait for and is not blocked.
+    research.views = {"AAA": {"available": True, "piotroski": 6, "next_earnings": far, "next_earnings_end": far},
+                      "BBB": {"available": False, "fetch_failed": False, "reason": "No fundamental data available"}}
+    summary = await agent.run_cycle(force=True)
+    assert {"AAA", "BBB"} <= {e["symbol"] for e in summary["entries"]}
+
+
+async def test_research_outage_blocks_entries_and_recovery_is_seen_within_minutes(db_tables, market):
+    """R1 with the real ResearchService: an outage no longer fails open, and its negative cache is short."""
+    from backend import cache
+    from backend.research.service import TRANSIENT_FAILURE_TTL, ResearchService
+    from tests.research_fixtures import make_snapshot
+
+    import time
+
+    tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+    state = {"down": True}
+
+    def fetch(sym):
+        if state["down"]:
+            raise RuntimeError("YFRateLimitError: Too Many Requests")
+        snap = make_snapshot(sym)
+        snap["calendar"] = {"next_earnings": tomorrow, "next_earnings_end": tomorrow, "ex_dividend": None}
+        return snap
+
+    agent = agent_for(market, research=ResearchService(market=market, snapshot_fetcher=fetch))
+    summary = await agent.run_cycle(force=True)
+    assert summary["entries"] == []
+    text = " ".join(" ".join(d.reasons or []) for d in await rows(BotDecision))
+    assert "Earnings date unknown (Fundamental data fetch failed" in text
+    key = "research:snapshot-failed:AAA"
+    assert cache._local[key][0] - time.monotonic() <= TRANSIENT_FAILURE_TTL <= 5 * 60   # minutes, not 30 min
+    state["down"] = False                                                        # Yahoo recovers ...
+    for k in [k for k in cache._local if k.startswith("research:snapshot-failed:")]:
+        cache._local[k] = (time.monotonic() - 1, cache._local[k][1])             # ... and the short TTL passes
+    summary = await agent.run_cycle(force=True)
+    assert summary["entries"] == []                                              # every symbol reports tomorrow
+    text = " ".join(" ".join(d.reasons or []) for d in await rows(BotDecision))
+    assert f"Earnings {tomorrow}: gap-risk blackout" in text
+
+
 async def test_slow_llm_review_times_out_to_the_fail_safe(db_tables, market, monkeypatch):
     import asyncio
 

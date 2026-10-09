@@ -143,6 +143,9 @@ def score(fundamentals: Dict[str, Any], valuation: Dict[str, Any], snapshot: Dic
     if currency.get("mismatch"):
         notes.append(f"Statements in {currency.get('financial')} vs price in {currency.get('trading')}: value "
                      f"metrics unavailable (not scored)")
+    elif currency.get("unknown"):
+        notes.append("Reporting currency unknown (company profile failed to load): value metrics unavailable "
+                     "(not scored)")
     if factors["value"]["score"] is None:
         notes.append("No value metric available: composite excludes valuation")
     return {

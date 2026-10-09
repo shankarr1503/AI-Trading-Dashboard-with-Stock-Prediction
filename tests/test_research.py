@@ -5,6 +5,7 @@ import time
 from datetime import date
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -13,8 +14,10 @@ from backend.config import settings
 from backend.research import scorecard as sc
 from backend.research.analyst import AnalystError, ClaudeAnalyst, add_usage, empty_usage, quant_report, validate_report
 from backend.research.data import _date_range, failed_sections, fetch_snapshot_sync, normalize_statement
-from backend.research.fundamentals import analyze_fundamentals, classify_business, merge_annual
-from backend.research.service import DEGRADED_SNAPSHOT_TTL, SNAPSHOT_TTL, ResearchService
+from backend.research.fundamentals import analyze_fundamentals, cash_flow_basis, classify_business, fcff, merge_annual
+from backend.research.service import (
+    DEGRADED_SNAPSHOT_TTL, NEGATIVE_TTL, SNAPSHOT_TTL, TRANSIENT_FAILURE_TTL, ResearchService, SnapshotUnavailable,
+)
 from backend.research.valuation import dcf_enterprise_value, implied_growth, value_company
 from tests.conftest import FakeMarket, make_ohlcv, make_trending
 from tests.research_fixtures import FakeTicker, make_snapshot, scale_item, yf_frames
@@ -362,7 +365,8 @@ def test_currency_mismatch_disables_mixed_unit_valuation_and_strong_ratings():
     assert quant_report(d_same)["rating"] == "STRONG_BUY"
 
     f, v, card = d_adr["fundamentals"], d_adr["valuation"], d_adr["scorecard"]
-    assert f["currency"] == {"trading": "USD", "financial": "TWD", "mismatch": True}
+    assert f["currency"] == {"trading": "USD", "financial": "TWD", "mismatch": True, "unknown": False,
+                             "comparable": False}
     for k in ("pe", "forward_pe", "ev_ebitda", "ev_sales", "price_to_fcf", "fcf_yield", "earnings_yield", "price_to_book"):
         assert v["multiples"][k] is None, k
     assert v["enterprise_value"] is None and v["method"] == "none" and v["fair_value"] is None
@@ -614,7 +618,13 @@ def test_report_endpoint_runs_paid_analyst_only_on_explicit_request(db_tables, r
         assert c.get("/api/research/SYN/report", headers=h).json()["ai_generation_available"] is False
         assert c.get("/api/research/SYN/report?refresh=true", headers=h).json()["source"] == "quant_model"
         assert msgs.calls == 1
-        assert c.get("/api/research/SYN/report?refresh=true", headers=h_admin).json()["source"] == "claude"
+        # R8: a retry minutes after a paid run (e.g. one the browser stopped waiting for) reuses it...
+        again = c.get("/api/research/SYN/report?refresh=true", headers=h_admin).json()
+        assert again["source"] == "claude" and again["reused_recent"] and again["id"] == gen["id"]
+        assert c.post("/api/research/SYN/report", headers=h_admin).json()["reused_recent"] and msgs.calls == 1
+        # ...unless the administrator explicitly forces a new one.
+        forced = c.post("/api/research/SYN/report?force=true", headers=h_admin).json()
+        assert forced["source"] == "claude" and forced["id"] != gen["id"] and "reused_recent" not in forced
         assert msgs.calls == 2
 
 
@@ -672,10 +682,19 @@ def test_non_admin_screen_size_is_capped(db_tables, research, monkeypatch):
     from backend.main import app
     import backend.research.router as rr
 
-    monkeypatch.setitem(rr.UNIVERSES, "big_universe", [f"S{i}" for i in range(rr.NON_ADMIN_MAX_SCREEN_SYMBOLS + 1)])
+    big = [f"S{i}" for i in range(rr.NON_ADMIN_MAX_SCREEN_SYMBOLS + 1)]
+    monkeypatch.setitem(rr.UNIVERSES, "big_universe", big)
+    monkeypatch.setattr(settings, "BOT_UNIVERSE", ",".join(big))
     with TestClient(app) as c:
         h_admin, h = _tokens(c)
-        assert c.post("/api/research/screen", headers=h, json={"universe": "big_universe"}).status_code == 422
+        # A custom list is capped for non-admins...
+        capped = c.post("/api/research/screen", headers=h, json={"symbols": big})
+        assert capped.status_code == 422 and "custom symbols" in capped.json()["detail"]
+        # ...but a predefined universe is screened whole (R9: an operator's BOT_UNIVERSE of > 40 symbols
+        # used to return 422 for every non-admin who picked it from the dropdown).
+        for universe in ("big_universe", "bot_universe"):
+            r = c.post("/api/research/screen", headers=h, json={"universe": universe})
+            assert r.status_code == 200 and r.json()["count"] == len(big), universe
         assert c.post("/api/research/screen", headers=h_admin, json={"universe": "big_universe"}).status_code == 200
 
 
@@ -693,3 +712,296 @@ def test_usage_sums_fallback_iterations_cache_tokens_and_web_searches():
                                          iterations=None, server_tool_use={"web_search_requests": 1}))
     assert acc["input_tokens"] == 230 and acc["cache_creation_input_tokens"] == 47 and acc["web_search_requests"] == 3
     assert add_usage(acc, None)["api_calls"] == 3
+
+
+# ─── Regression tests for the second research review (R1–R9) ────────────────
+
+def _expire(key):
+    """Simulate a cache entry's TTL running out."""
+    _, raw = cache._local[key]
+    cache._local[key] = (time.monotonic() - 1, raw)
+
+
+def _yf(monkeypatch, **kw):
+    """fetch_snapshot_sync against a FakeTicker (no network)."""
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(Ticker=lambda s: FakeTicker(s, **kw)))
+
+
+ALL_SECTIONS = {"info", "fast_info", "income_stmt", "balance_sheet", "cash_flow", "q_income_stmt", "q_cash_flow",
+                "analyst_price_targets", "recommendations_summary", "upgrades_downgrades", "earnings_history",
+                "growth_estimates", "revenue_estimate", "earnings_estimate", "insider_transactions", "calendar"}
+
+
+# R1: a FAILED fetch says so (the bot's earnings blackout fails closed on it) and is retried within minutes;
+# "Yahoo answered and has no data" is cached for the long negative TTL and is not a fetch failure.
+async def test_failed_fetch_is_flagged_and_retried_soon_while_no_data_is_cached_long(monkeypatch):
+    state, calls = {"down": True}, []
+
+    def fetch(sym):
+        calls.append(sym)
+        if sym == "FUND":                                          # answered: no price, no statements
+            _yf(monkeypatch, info={"quoteType": "MUTUALFUND", "currency": "USD"}, fast={},
+                empty={"income_stmt", "balance_sheet", "cash_flow"})
+            return fetch_snapshot_sync(sym)
+        if sym == "LIMITED":                                       # every section rate limited
+            _yf(monkeypatch, fail=ALL_SECTIONS)
+            return fetch_snapshot_sync(sym)
+        if sym == "NOSUCH":                                        # 404s, swallowed by yfinance: empty answers
+            _yf(monkeypatch, info={"trailingPegRatio": None}, fast={}, calendar={},
+                empty={"income_stmt", "balance_sheet", "cash_flow"})
+            return fetch_snapshot_sync(sym)
+        if state["down"]:
+            raise RuntimeError("YFRateLimitError: Too Many Requests")
+        return make_snapshot(sym)
+
+    svc = ResearchService(market=FakeMarket({"SYN": make_trending(1)}), snapshot_fetcher=fetch)
+    view = await svc.fundamental_view("SYN")
+    assert view["available"] is False and view["fetch_failed"] is True and view["earnings_unknown"] is True
+    assert "fetch failed" in view["reason"]
+    assert TRANSIENT_FAILURE_TTL <= 5 * 60                         # minutes, not the 30 min "no data" TTL
+    assert 0 < cache._local["research:snapshot-failed:SYN"][0] - time.monotonic() <= TRANSIENT_FAILURE_TTL
+    await svc.fundamental_view("SYN")
+    assert calls == ["SYN"]                                        # not hammered within the short TTL
+    state["down"] = False                                          # Yahoo recovers ...
+    _expire("research:snapshot-failed:SYN")                        # ... and TRANSIENT_FAILURE_TTL passes
+    assert (await svc.fundamental_view("SYN"))["available"] is True and calls == ["SYN", "SYN"]
+
+    limited = await svc.fundamental_view("LIMITED")
+    assert limited["available"] is False and limited["fetch_failed"] is True
+    assert cache._local["research:snapshot-failed:LIMITED"][0] - time.monotonic() <= TRANSIENT_FAILURE_TTL
+
+    # Empty answers only: an unknown symbol, or a 401/5xx outage yfinance swallowed. Indistinguishable, so
+    # retried soon and treated as unknown (fail closed), with a message that says it may be either.
+    nosuch = await svc.fundamental_view("NOSUCH")
+    assert nosuch["available"] is False and nosuch["fetch_failed"] is True and "may not exist" in nosuch["reason"]
+    assert cache._local["research:snapshot-failed:NOSUCH"][0] - time.monotonic() <= TRANSIENT_FAILURE_TTL
+
+    fund = await svc.fundamental_view("FUND")
+    assert fund["available"] is False and fund["fetch_failed"] is False and not fund.get("earnings_unknown")
+    assert cache._local["research:snapshot-failed:FUND"][0] - time.monotonic() > NEGATIVE_TTL - 60
+    with pytest.raises(SnapshotUnavailable) as ei:                # the API tells the two apart too (503 vs 404)
+        await svc.snapshot("LIMITED")
+    assert ei.value.transient is True
+
+
+def test_research_api_reports_a_failed_fetch_as_temporary(db_tables, monkeypatch):
+    from backend.main import app
+    import backend.research.router as rr
+
+    def fetch(sym):
+        if sym == "DOWN":
+            raise ConnectionError("reset by peer")
+        raise ValueError(f"No fundamental data available for '{sym}'")
+
+    monkeypatch.setattr(rr, "research_service", ResearchService(market=FakeMarket({}), snapshot_fetcher=fetch))
+    with TestClient(app) as c:
+        _, h = _tokens(c)
+        assert c.get("/api/research/DOWN/fundamentals", headers=h).status_code == 503
+        assert c.get("/api/research/NODATA/fundamentals", headers=h).status_code == 404
+
+
+# R2: yfinance hides 401 "Invalid Crumb" / 403 / 5xx (hide_exceptions=True): `info` comes back empty or
+# quote-only and `calendar` as {}. Those are failed sections, not "no earnings scheduled".
+def test_swallowed_http_errors_are_failed_sections_not_missing_data(monkeypatch):
+    def run(**kw):
+        _yf(monkeypatch, **kw)
+        return fetch_snapshot_sync("AAPL")
+
+    snap = run(info={"trailingPegRatio": None}, calendar={})       # every quoteSummary call answered 401
+    assert set(failed_sections(snap)) == {"info", "calendar"}
+    assert snap["calendar"]["next_earnings"] is None
+    quote_only = {"quoteType": "EQUITY", "currency": "USD", "regularMarketPrice": 75.0, "shortName": "Apple"}
+    snap = run(info=quote_only, calendar={"Earnings Date": [date(2026, 10, 28)]})
+    assert failed_sections(snap) == ["info"]                       # v7 quote only: quoteSummary failed
+    # Real answers are not failures: an ETF has no earnings calendar, an equity may have none scheduled.
+    assert failed_sections(run(info={"quoteType": "ETF", "currency": "USD", "longName": "Index Fund"},
+                               calendar={})) == []
+    snap = run(info={**quote_only, "sector": "Technology", "financialCurrency": "USD"}, calendar={"Earnings Date": []})
+    assert failed_sections(snap) == [] and snap["calendar"]["next_earnings"] is None
+
+
+async def test_swallowed_calendar_error_makes_the_earnings_date_unknown_and_is_retried_soon(monkeypatch):
+    def fetch(sym):
+        _yf(monkeypatch, calendar={})                              # 500 on calendarEvents, swallowed
+        return fetch_snapshot_sync(sym)
+
+    svc = ResearchService(market=FakeMarket({"SYN": make_trending(1)}), snapshot_fetcher=fetch)
+    view = await svc.fundamental_view("SYN")
+    assert view["available"] and view["earnings_unknown"] is True and view["data_degraded"] is True
+    assert cache._local["research:snapshot:SYN"][0] - time.monotonic() <= DEGRADED_SNAPSHOT_TTL   # not 12 h
+    assert cache._local["research:dossier:SYN"][0] - time.monotonic() <= DEGRADED_SNAPSHOT_TTL
+    # Expires before the bot's next cycle, so the blackout re-checks the real date once Yahoo answers again.
+    assert DEGRADED_SNAPSHOT_TTL < settings.BOT_CYCLE_MINUTES * 60
+
+
+# R3: when the profile (`info`) fails, the reporting currency and business model are UNKNOWN — the ADR
+# guard must not silently switch off, and a bank must not get a DCF.
+def test_failed_profile_means_unknown_currency_and_business_model_no_valuation(monkeypatch):
+    fast = {"lastPrice": 180.0, "marketCap": 180.0 * 5.19e9, "shares": 5.19e9, "currency": "USD"}
+    tsm = {"longName": "Taiwan Semi", "sector": "Technology", "industry": "Semiconductors", "currency": "USD",
+           "financialCurrency": "TWD", "beta": 1.2}
+
+    def analysed(**kw):
+        _yf(monkeypatch, fast=fast, **kw)
+        snap = fetch_snapshot_sync("TSM")
+        f = analyze_fundamentals(snap)
+        return snap, f, value_company(snap, f)
+
+    snap, f, v = analysed(info=tsm)                                # profile OK: known mismatch
+    assert f["currency"]["mismatch"] and v["method"] == "none"
+    for kw in ({"info": tsm, "fail": {"info"}}, {"info": {"trailingPegRatio": None}}):   # raised / swallowed
+        snap, f, v = analysed(**kw)
+        assert "info" in failed_sections(snap) and snap["profile"]["financial_currency"] is None
+        assert f["currency"]["unknown"] and not f["currency"]["comparable"] and not f["currency"]["mismatch"]
+        assert f["business_model"]["type"] == "unknown" and f["altman"]["zone"] == "insufficient_data"
+        assert v["method"] == "none" and v["fair_value"] is None and v["upside_pct"] is None
+        assert v["enterprise_value"] is None and v["multiples"]["pe"] is None
+        assert any("currency unknown" in w for w in v["warnings"])
+        card = sc.score(f, v, snap, {})
+        assert card["factors"]["value"]["score"] is None and any("currency unknown" in n for n in card["notes"])
+
+
+# R4: Z'' has no market-value term, so buyback-shrunk book equity can read "distress" for a profitable,
+# well-covered company: a flag, not a SELL cap or bot veto, unless other distress signals corroborate it.
+async def test_uncorroborated_z_double_prime_distress_is_a_flag_not_a_sell_or_veto():
+    buyback = make_snapshot("BUYBK", price=40.0, distressed=True)    # negative WC and RE, EBIT covers interest 20x
+    weak = make_snapshot("WEAK", price=40.0, distressed=True, debt=800e9)                      # coverage ~1x
+    negeq = scale_item(make_snapshot("NEGEQ", price=40.0, distressed=True, debt=390e9), "balance", "equity", -0.1)
+
+    f = analyze_fundamentals(buyback)
+    a = f["altman"]
+    assert a["model"] == "z_double_prime" and a["zone"] == "distress"
+    assert a["distress_corroborated"] is False and a["distress_evidence"] == [] and "not corroborated" in a["note"]
+    assert any("not corroborated" in x for x in f["flags"])
+    rep = quant_report(dossier_for(buyback, make_trending(1)))
+    assert rep["rating"] in ("BUY", "STRONG_BUY") and all(r["severity"] != "high" for r in rep["risks"])
+
+    for snap, evidence in ((weak, "interest coverage"), (negeq, "negative book equity")):
+        f = analyze_fundamentals(snap)
+        assert f["altman"]["zone"] == "distress" and f["altman"]["distress_corroborated"] is True
+        assert any(evidence in e for e in f["altman"]["distress_evidence"])
+        assert not any("not corroborated" in x for x in f["flags"])
+        rep = quant_report(dossier_for(snap, make_trending(1)))
+        assert rep["rating"] in ("SELL", "STRONG_SELL") and any(r["severity"] == "high" for r in rep["risks"])
+
+    snaps = {"BUYBK": buyback, "WEAK": weak}
+    svc = ResearchService(market=FakeMarket({s: make_trending(1) for s in snaps}), snapshot_fetcher=snaps.__getitem__)
+    assert (await svc.fundamental_view("BUYBK"))["altman_distress_corroborated"] is False
+    assert (await svc.fundamental_view("WEAK"))["altman_distress_corroborated"] is True
+    # Utilities and REITs are still not scored by Altman at all (earlier fix kept).
+    util = analyze_fundamentals(make_snapshot(sector="Utilities", industry="Utilities - Regulated Electric",
+                                              distressed=True, margin=0.12))
+    assert util["altman"]["zone"] == "not_applicable"
+
+
+async def test_bot_vetoes_only_corroborated_altman_distress(db_tables):
+    from backend.database.models import BotDecision
+    from backend.database.session import AsyncSessionLocal
+    from backend.trading.agent import TradingAgent
+    from sqlalchemy import select
+    from tests.conftest import FakePredictor, FakeResearch
+    from tests.test_agent import broker_factory
+
+    market = FakeMarket({"AAA": make_trending(1), "BBB": make_trending(2)})
+    research = FakeResearch({
+        "AAA": {"available": True, "piotroski": 6, "altman_zone": "distress", "altman_distress_corroborated": False},
+        "BBB": {"available": True, "piotroski": 6, "altman_zone": "distress", "altman_distress_corroborated": True},
+    })
+    agent = TradingAgent(market=market, predictor=FakePredictor(), broker_factory=broker_factory, use_llm=False,
+                         research=research)
+    summary = await agent.run_cycle(force=True)
+    assert {e["symbol"] for e in summary["entries"]} == {"AAA"}
+    async with AsyncSessionLocal() as db:
+        skipped = {d.symbol: d.reasons for d in (await db.execute(select(BotDecision))).scalars() if d.action == "SKIP"}
+    assert "Altman Z in the distress zone" in skipped["BBB"]
+
+
+# R5: exchanges / data vendors / insurance brokers and goodwill-heavy fund managers are not banks.
+def test_fee_businesses_and_goodwill_heavy_financials_are_not_banks():
+    B = 1e9
+
+    def kind(industry, ta, rev, fcf, **extra):
+        return classify_business("Financial Services", industry,
+                                 {"total_assets": ta * B, "revenue": rev * B, "fcf": fcf * B,
+                                  **{k: v * B for k, v in extra.items()}})["type"]
+
+    exchanges = "Financial Data & Stock Exchanges"
+    for industry, ta, rev, fcf in ((exchanges, 60.2, 14.2, 5.6),      # S&P Global: goodwill
+                                   (exchanges, 137.4, 6.1, 3.6),      # CME: clearing margin deposits ~22x
+                                   (exchanges, 139.4, 11.8, 4.2),     # ICE
+                                   ("Insurance Brokers", 49.0, 15.7, 2.8),   # Aon: fiduciary assets
+                                   ("Insurance Brokers", 64.6, 11.6, 2.0)):  # Gallagher
+        assert kind(industry, ta, rev, fcf) == "asset_light_financial", (industry, ta)
+    # BlackRock: 6.8x on total assets, ~3.9x on tangible assets (goodwill + intangibles ~57B).
+    assert kind("Asset Management", 138.6, 20.4, 4.4, goodwill_intangibles=57.0) == "asset_light_financial"
+    assert kind("Asset Management", 138.6, 20.4, 4.4, goodwill=25.0, other_intangibles=32.0) == "asset_light_financial"
+    assert kind("Asset Management", 9.0, 1.0, 0.5) == "balance_sheet_financial"        # BDC: a loan book ~9x revenue
+    assert kind("Credit Services", 94.5, 35.9, 18.7) == "asset_light_financial"        # Visa
+    assert kind("Credit Services", 271.5, 65.9, 12.0) == "balance_sheet_financial"     # AmEx: deposit-funded card lender
+    assert kind("Credit Services", 80.0, 32.0, 5.0, net_loans=30.0) == "balance_sheet_financial"   # reported loan book
+
+    snap = make_snapshot("SPGI", sector="Financial Services", industry=exchanges, margin=0.3, fcf_margin=0.35)
+    scale_item(snap, "balance", "total_assets", 3)                  # grossed-up balance sheet
+    f = analyze_fundamentals(snap)
+    assert not f["is_financial"] and value_company(snap, f)["method"] == "dcf"     # not a justified P/B
+    rows = normalize_statement(pd.DataFrame({pd.Timestamp("2025-12-31"): {
+        "GoodwillAndOtherIntangibleAssets": 5.0, "NetLoan": 7.0, "InterestPaidCFF": -2.0, "InterestPaidCFO": -1.0}}))
+    assert rows["2025-12-31"] == {"goodwill_intangibles": 5.0, "net_loans": 7.0, "interest_paid_cff": -2.0,
+                                  "interest_paid_cfo": -1.0}
+
+
+# R6: Ind AS 7 (and the IFRS financing option) put interest paid outside operating cash flow, so FCF is
+# already before interest: adding after-tax interest back again double-counts it.
+def test_fcff_does_not_add_back_interest_already_outside_operating_cash_flow():
+    cr = 1e7                                                       # Reliance-like FY24, INR crore
+    rel = {"fcf": (158_788 - 131_769) * cr, "interest_expense": 23_118 * cr, "pretax_income": 104_727 * cr,
+           "tax": 25_707 * cr}
+    t = rel["tax"] / rel["pretax_income"]
+    assert fcff(rel, interest_in_operating_cf=False) == pytest.approx(rel["fcf"] - rel["interest_expense"] * t)
+    assert fcff(rel) == pytest.approx(rel["fcf"] + rel["interest_expense"] * (1 - t))   # US GAAP default
+    assert fcff({**rel, "interest_paid_cff": -23_000 * cr}) == fcff(rel, interest_in_operating_cf=False)
+    assert fcff({**rel, "interest_paid_cfo": -23_000 * cr}, interest_in_operating_cf=False) == fcff(rel)
+
+    india = make_snapshot("LEV.NS", debt=150e9, fcf_margin=0.12, trading_currency="INR", financial_currency="INR")
+    us = make_snapshot("LEV", debt=150e9, fcf_margin=0.12)
+    p = merge_annual(india)["2025-12-31"]
+    t = p["tax"] / p["pretax_income"]
+    f_in, f_us = analyze_fundamentals(india), analyze_fundamentals(us)
+    assert f_in["cash_flow_basis"]["interest_in_operating_cf"] is False
+    assert f_us["cash_flow_basis"]["interest_in_operating_cf"] is True
+    assert f_in["history"][-1]["fcff"] == pytest.approx(p["fcf"] - p["interest_expense"] * t)
+    assert f_us["history"][-1]["fcff"] == pytest.approx(p["fcf"] + p["interest_expense"] * (1 - t))
+    v_in, v_us = value_company(india, f_in), value_company(us, f_us)
+    assert v_in["fcff_base"] < v_us["fcff_base"] and v_in["fair_value"] < v_us["fair_value"]
+    assert any("Ind AS 7" in a for a in v_in["assumptions"])
+    ifrs = make_snapshot("IFRS.PA", debt=150e9, fcf_margin=0.12)   # an IFRS filer reporting where interest sits
+    for row in ifrs["statements"]["annual"]["cashflow"].values():
+        row["interest_paid_cff"] = -6e9
+    f_ifrs = analyze_fundamentals(ifrs)
+    assert f_ifrs["cash_flow_basis"] == {"interest_in_operating_cf": False,
+                                         "note": "Interest paid reported in financing cash flow"}
+    assert f_ifrs["history"][-1]["fcff"] == pytest.approx(f_in["history"][-1]["fcff"])
+    for detect in ({"country": "India"}, {"financial_currency": "INR"}):               # not only by suffix
+        snap = make_snapshot("RELI")
+        snap["profile"].update(detect)
+        assert cash_flow_basis(snap)["interest_in_operating_cf"] is False, detect
+
+
+# R8: a paid run outlives a client that stopped waiting; a retry shortly after must not pay again.
+async def test_refresh_shortly_after_a_paid_run_reuses_it_unless_forced(db_tables, monkeypatch):
+    from backend.database.session import AsyncSessionLocal
+
+    monkeypatch.setattr(settings, "RESEARCH_LLM_ENABLED", True)
+    msgs = _CountingMessages(base_report())
+    svc = ResearchService(market=FakeMarket({"SYN": make_trending(1)}), snapshot_fetcher=make_snapshot,
+                          analyst=ClaudeAnalyst(client=_client(msgs), web_search=False))
+    async with AsyncSessionLocal() as db:
+        first = await svc.report(db, "SYN", allow_llm=True, refresh=True)   # the browser gave up; the run finished
+        await db.commit()
+    async with AsyncSessionLocal() as db:
+        retry = await svc.report(db, "SYN", allow_llm=True, refresh=True)
+    assert msgs.calls == 1 and retry["reused_recent"] is True and retry["id"] == first["id"]
+    async with AsyncSessionLocal() as db:
+        forced = await svc.report(db, "SYN", allow_llm=True, refresh=True, force=True)
+        await db.commit()
+    assert msgs.calls == 2 and forced["id"] != first["id"] and forced["source"] == "claude"

@@ -13,15 +13,25 @@ from backend.database.models import ResearchReport, User
 from backend.database.session import get_db
 from backend.market_data.service import validate_symbol
 from backend.ratelimit import limiter
-from backend.research.service import UNIVERSES, research_service
+from backend.research.service import UNIVERSES, SnapshotUnavailable, research_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # Screens fan out into one ~15-request Yahoo fetch per uncached symbol, so
-# non-admins may only screen the curated universes, in bounded batches.
+# non-admins may only screen symbols from the predefined universes, and a
+# custom list of them is capped. A named universe (curated, or the operator's
+# BOT_UNIVERSE, which the bot keeps cached anyway) is screened whole: its size
+# is set by the operator, not by the caller.
 ADMIN_MAX_SCREEN_SYMBOLS = 150
 NON_ADMIN_MAX_SCREEN_SYMBOLS = 40
+
+
+def _not_available(e: ValueError) -> HTTPException:
+    """A failed fetch (Yahoo down / rate limited) is temporary (503); no data or a bad symbol is 404."""
+    if isinstance(e, SnapshotUnavailable) and e.transient:
+        return HTTPException(status_code=503, detail=f"{e}. Try again in a few minutes.")
+    return HTTPException(status_code=404, detail=str(e))
 
 
 def screenable_symbols() -> set:
@@ -43,7 +53,7 @@ async def fundamentals(request: Request, symbol: str, user: User = Depends(get_c
     try:
         return await research_service.dossier(symbol)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise _not_available(e)
 
 
 def _with_capabilities(result: dict, user: User) -> dict:
@@ -56,6 +66,8 @@ async def report(
     request: Request, symbol: str,
     refresh: bool = Query(False, description="Generate a new report even if a recent one exists "
                                              "(for administrators this runs the paid AI analyst)"),
+    force: bool = Query(False, description="With refresh: run the AI analyst even if it produced a report "
+                                           "for this symbol in the last few minutes"),
     db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """
@@ -66,21 +78,26 @@ async def report(
     """
     try:
         result = await research_service.report(db, symbol, allow_llm=user.is_superuser and refresh,
-                                               refresh=refresh, user_id=user.id)
+                                               refresh=refresh, user_id=user.id, force=force)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise _not_available(e)
     return _with_capabilities(result, user)
 
 
 @router.post("/{symbol}/report")
 @limiter.limit("5/minute")
-async def generate_report(request: Request, symbol: str, db: AsyncSession = Depends(get_db),
-                          user: User = Depends(get_current_user)):
+async def generate_report(
+    request: Request, symbol: str,
+    force: bool = Query(False, description="Run the AI analyst even if it produced a report for this symbol in the "
+                                           "last few minutes (otherwise that report is returned, `reused_recent`)"),
+    db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user),
+):
     """Explicitly generate a new report (the paid AI analyst for administrators, rules-based otherwise)."""
     try:
-        result = await research_service.report(db, symbol, allow_llm=user.is_superuser, refresh=True, user_id=user.id)
+        result = await research_service.report(db, symbol, allow_llm=user.is_superuser, refresh=True, user_id=user.id,
+                                               force=force)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise _not_available(e)
     return _with_capabilities(result, user)
 
 
@@ -109,8 +126,9 @@ class ScreenRequest(BaseModel):
 async def screen(request: Request, body: ScreenRequest, user: User = Depends(get_current_user)):
     """
     Rank a universe by the multi-factor scorecard (no AI cost). Administrators
-    may screen any symbols; other users may screen the predefined universes
-    (or a subset of them), at most NON_ADMIN_MAX_SCREEN_SYMBOLS at a time.
+    may screen any symbols; other users may screen a predefined universe whole
+    (bot_universe included, whatever its configured size) or a custom subset of
+    them of at most NON_ADMIN_MAX_SCREEN_SYMBOLS symbols.
     """
     if body.symbols:
         try:
@@ -129,7 +147,8 @@ async def screen(request: Request, body: ScreenRequest, user: User = Depends(get
             raise HTTPException(status_code=403, detail=(
                 "Custom symbols can only be screened by an administrator; choose symbols from the predefined "
                 f"universes. Not allowed: {', '.join(outside[:10])}{' …' if len(outside) > 10 else ''}"))
-        if len(symbols) > NON_ADMIN_MAX_SCREEN_SYMBOLS:
-            raise HTTPException(status_code=422, detail=f"At most {NON_ADMIN_MAX_SCREEN_SYMBOLS} symbols per screen")
+        if body.symbols and len(symbols) > NON_ADMIN_MAX_SCREEN_SYMBOLS:
+            raise HTTPException(status_code=422, detail=f"At most {NON_ADMIN_MAX_SCREEN_SYMBOLS} custom symbols per "
+                                                        f"screen (or choose a predefined universe)")
     rows = await research_service.screen(symbols)
     return {"count": len(rows), "results": rows}

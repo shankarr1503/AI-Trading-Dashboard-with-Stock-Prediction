@@ -31,6 +31,10 @@ STATEMENT_ITEMS: Dict[str, List[str]] = {
     "diluted_eps": ["DilutedEPS"],
     "diluted_shares": ["DilutedAverageShares"],
     "total_assets": ["TotalAssets"],
+    "goodwill_intangibles": ["GoodwillAndOtherIntangibleAssets"],
+    "goodwill": ["Goodwill"],
+    "other_intangibles": ["OtherIntangibleAssets"],
+    "net_loans": ["NetLoan", "LoansReceivable"],
     "current_assets": ["CurrentAssets"],
     "current_liabilities": ["CurrentLiabilities"],
     "total_liabilities": ["TotalLiabilitiesNetMinorityInterest"],
@@ -42,6 +46,9 @@ STATEMENT_ITEMS: Dict[str, List[str]] = {
     "working_capital": ["WorkingCapital"],
     "shares_outstanding": ["OrdinarySharesNumber", "ShareIssued"],
     "operating_cf": ["OperatingCashFlow"],
+    # Where interest paid sits in the cash-flow statement (IFRS / Ind AS let it be financing).
+    "interest_paid_cfo": ["InterestPaidCFO"],
+    "interest_paid_cff": ["InterestPaidCFF"],
     "capex": ["CapitalExpenditure"],
     "fcf": ["FreeCashFlow"],
     "dividends_paid": ["CashDividendsPaid", "CommonStockDividendPaid"],
@@ -156,23 +163,66 @@ def failed_sections(snapshot: Dict[str, Any]) -> List[str]:
     return out
 
 
+# Error markers for sections that "succeeded" with an empty payload because
+# yfinance swallowed the HTTP error (see info_complete / fetch_snapshot_sync).
+# Yahoo answers an unknown symbol the same way (a 404 that is swallowed too), so
+# these alone cannot tell "Yahoo failing" from "no such symbol".
+SWALLOWED_ERRORS = ("IncompleteResponse", "EmptyResponse")
+
+
+def info_complete(info: Dict[str, Any]) -> bool:
+    """
+    Whether `info` is a real answer. yfinance hides most HTTP errors by default
+    (YfConfig.debug.hide_exceptions=True): a 401 "Invalid Crumb", 403 or 5xx on
+    quoteSummary is logged and turned into an empty (or v7-quote-only) `info`
+    instead of raising. A real response always identifies the instrument
+    (quoteType / currency), and for an equity also carries the quoteSummary
+    profile and financial data (sector, industry, financialCurrency).
+    """
+    if not info or not (info.get("quoteType") or info.get("currency")):
+        return False
+    if str(info.get("quoteType") or "").upper() == "EQUITY" and not (
+            info.get("sector") or info.get("industry") or info.get("financialCurrency")):
+        return False
+    return True
+
+
 def fetch_snapshot_sync(symbol: str) -> Dict[str, Any]:
-    """Blocking: call from a worker thread."""
+    """
+    Blocking: call from a worker thread.
+
+    yfinance's hide_exceptions switch is process-wide (shared with the market
+    data code running in other threads) and, turned off, also raises for
+    modules Yahoo legitimately lacks; so it is left alone and the swallowed
+    failures that matter are detected from the payload instead: an incomplete
+    `info` and an empty `calendar` (see below) are recorded as failed sections.
+    """
     import yfinance as yf
 
     t = yf.Ticker(symbol)
     gaps: List[str] = []
     errors: List[Dict[str, str]] = []  # sections that FAILED (vs. merely empty)
 
+    def record_failure(name: str, error: str) -> None:
+        gaps.append(f"{name}: {error}")
+        errors.append({"section": name, "error": error})
+
     def attempt(name: str, fn, default=None):
         try:
             return fn()
         except Exception as e:  # noqa: BLE001 - every section is optional
-            gaps.append(f"{name}: {type(e).__name__}")
-            errors.append({"section": name, "error": type(e).__name__})
+            record_failure(name, type(e).__name__)
             return default
 
+    def failed(name: str) -> bool:
+        return any(e["section"] == name for e in errors)
+
     info = attempt("info", lambda: t.info or {}, {}) or {}
+    if not isinstance(info, dict):
+        info = {}
+    if not failed("info") and not info_complete(info):
+        record_failure("info", SWALLOWED_ERRORS[0])
+    info_ok = not failed("info")
     fast = attempt("fast_info", lambda: t.fast_info, None)
 
     def fast_get(key):
@@ -211,13 +261,23 @@ def fetch_snapshot_sync(symbol: str) -> Dict[str, Any]:
     calendar = attempt("calendar", lambda: t.calendar, {}) or {}
     if not isinstance(calendar, dict):
         calendar = {}
+    # A calendarEvents answer for an equity always yields keys ("Earnings Date",
+    # possibly an empty list, dividend dates); a completely empty dict is what
+    # yfinance returns after swallowing an HTTP error. Unless the instrument is
+    # known not to be an equity (ETF, index, crypto...), treat it as a failed
+    # fetch so the earnings date is reported unknown, not "none scheduled".
+    quote_type = str(info.get("quoteType") or "").upper() if info_ok else ""
+    if not calendar and not failed("calendar") and quote_type in ("", "EQUITY"):
+        record_failure("calendar", SWALLOWED_ERRORS[1])
     earnings_start, earnings_end = _date_range(calendar.get("Earnings Date"))
 
     # Price/market cap are quoted in the trading currency; statements are in the
     # reporting currency. They differ for ADRs and many cross-listings (e.g. TSM:
-    # USD per ADR vs. TWD statements), and must never be mixed without FX.
+    # USD per ADR vs. TWD statements), and must never be mixed without FX. When
+    # `info` failed the reporting currency is UNKNOWN (None) — never assumed to
+    # equal the trading currency, which would silently disable the ADR guard.
     trading_currency = info.get("currency") or fast_get("currency") or None
-    financial_currency = info.get("financialCurrency") or trading_currency
+    financial_currency = (info.get("financialCurrency") or trading_currency) if info_ok else None
 
     summary = (info.get("longBusinessSummary") or "")[:2000]
     return {
@@ -227,8 +287,8 @@ def fetch_snapshot_sync(symbol: str) -> Dict[str, Any]:
             "sector": info.get("sector") or "",
             "industry": info.get("industry") or "",
             "country": info.get("country") or "",
-            # `currency` is the statement (reporting) currency, kept for compatibility.
-            "currency": financial_currency or "USD",
+            # `currency` is the statement (reporting) currency, kept for compatibility (display only).
+            "currency": financial_currency or trading_currency or "USD",
             "trading_currency": trading_currency,
             "financial_currency": financial_currency,
             "employees": info.get("fullTimeEmployees"),

@@ -79,10 +79,26 @@ export default function ResearchReport({ symbol }: { symbol: string }) {
     setGenerating(true);
     setError('');
     try {
-      const r = await researchApi.generateReport(symbol);
+      let r = await researchApi.generateReport(symbol);
+      if (r.data?.reused_recent) {
+        // A run finished minutes ago (e.g. one this page stopped waiting for): the server returned it
+        // instead of paying again. Re-running is an explicit second choice.
+        setReport(r.data);
+        const at = new Date(r.data.created_at).toLocaleTimeString();
+        if (window.confirm(`An AI analyst report for ${symbol} finished at ${at} and is shown now. Run another paid analysis anyway?`)) {
+          r = await researchApi.generateReport(symbol, true);
+        }
+      }
       setReport(r.data);
     } catch (e) {
-      setError(errorMessage(e, 'Report generation failed.'));
+      if (!(e as { response?: unknown })?.response) {
+        // Timed out or the connection dropped: the paid run is not cancelled and may still finish and be
+        // stored on the server. Show whatever is stored now rather than inviting a second paid run.
+        await load();
+        setError(`No answer from the AI analyst yet. The run may still be finishing on the server: the latest stored report is shown. Reload in a few minutes before generating again (a run that finished recently is reused, not paid twice).`);
+      } else {
+        setError(errorMessage(e, 'Report generation failed.'));
+      }
     }
     setGenerating(false);
   };
@@ -149,6 +165,11 @@ export default function ResearchReport({ symbol }: { symbol: string }) {
         {rep?.llm_failed && (
           <p className="text-xs mt-1" style={{ color: '#ff8a5c' }}>
             The last AI analyst run failed ({rep.llm_error}); showing the rules-based report. It will not be retried automatically for a few hours.
+          </p>
+        )}
+        {dossier?.data_quality?.degraded && (
+          <p className="text-xs mt-1" style={{ color: '#ff8a5c' }}>
+            Some data failed to load ({dossier.data_quality.failed_sections.join(', ')}): figures that depend on it are left out, not guessed. It is fetched again within 10 minutes.
           </p>
         )}
         {error && <p className="text-xs mt-2" style={{ color: '#ff4757' }}>{error}</p>}
@@ -235,7 +256,9 @@ export default function ResearchReport({ symbol }: { symbol: string }) {
               ['Share count change', pct(m.share_count_change)],
               ['Piotroski F-score', f.piotroski?.score !== null ? `${f.piotroski.score}/9` : 'n/a'],
               [f.altman?.model === 'z_double_prime' ? "Altman Z'' (non-mfg)" : f.altman?.model === 'z_prime' ? "Altman Z' (book)" : 'Altman Z',
-                f.altman?.z !== null && f.altman?.z !== undefined ? `${f.altman.z} (${f.altman.zone})` : String(f.altman?.zone ?? '—').replace('_', ' ')],
+                f.altman?.z !== null && f.altman?.z !== undefined
+                  ? `${f.altman.z} (${f.altman.zone}${f.altman.distress_corroborated === false ? ', not corroborated' : ''})`
+                  : String(f.altman?.zone ?? '—').replace('_', ' ')],
             ]} />
             {f.flags?.length > 0 && (
               <ul className="text-xs mt-3 space-y-0.5" style={{ color: '#ff8a5c' }}>{f.flags.map((x: string) => <li key={x}>⚠ {x}</li>)}</ul>

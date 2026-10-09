@@ -197,7 +197,10 @@ def quant_report(dossier: Dict[str, Any]) -> Dict[str, Any]:
         signal += 0.3 * max(-1.0, min(1.0, upside / 30))
     if street_up is not None:
         signal += 0.2 * max(-1.0, min(1.0, street_up / 30))
-    distressed = (fund.get("altman") or {}).get("zone") == "distress"
+    altman = fund.get("altman") or {}
+    # A Z'' distress reading not corroborated by losses, cash burn or weak
+    # interest coverage (buyback-shrunk book equity) is a flag, not distress.
+    distressed = altman.get("zone") == "distress" and altman.get("distress_corroborated", True)
     if distressed:
         signal = min(signal, -0.2)
     # A STRONG call needs a valuation anchor. When neither an intrinsic value nor
@@ -234,7 +237,7 @@ def quant_report(dossier: Dict[str, Any]) -> Dict[str, Any]:
         thesis.append(f"Model fair value {val['fair_value']} implies {upside:+.1f}% vs price {price}")
     if val.get("market_implied_growth") is not None:
         thesis.append(f"Market price implies {val['market_implied_growth']:.1%} initial FCF growth")
-    risks = [{"risk": flag, "severity": "high" if "distress" in flag.lower() else "medium", "mitigant": ""}
+    risks = [{"risk": flag, "severity": "high" if distressed and "distress" in flag.lower() else "medium", "mitigant": ""}
              for flag in fund.get("flags", [])]
     risks += [{"risk": f"Weak {k.replace('_', ' ')} profile ({s:.0f}/100)", "severity": "medium", "mitigant": ""}
               for k, s in ranked if s < 35][:3]
