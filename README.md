@@ -204,9 +204,11 @@ Builds are unsigned unless signing secrets are configured, so the first launch n
 - macOS: **System Settings → Privacy & Security → Open Anyway**.
 - On Ubuntu 24.04+, start the AppImage with `--no-sandbox` or from its menu entry.
 
-**First run.** Register an account in the app: on the desktop the first account becomes the administrator and
-registration then closes. The bot starts **paused, in paper mode**. Open the Bot page, read the decisions, and
-press Start when you're ready.
+**First run.** Register an account **in the app window**: on the desktop the first account becomes the
+administrator and registration then closes. The app vouches for that one request, so a web page or another
+program on the computer can't claim the account first. Opening the dashboard in a normal browser before you
+sign up shows "Create the first account in the AI Trading Bot app window". The bot starts **paused, in paper
+mode**. Open the Bot page, read the decisions, and press Start when you're ready.
 
 **Settings** live in `settings.env` in the data folder (tray menu → *Edit Settings*, then restart), e.g.
 `TRADING_MODE`, the Alpaca keys, `ANTHROPIC_API_KEY`, `LLM_REVIEW_ENABLED`, `BOT_UNIVERSE`, `ALERT_WEBHOOK_URL`.
@@ -218,9 +220,11 @@ The database location and the JWT secret are managed by the app and can't be ove
 They hold `trading.db`, `secret.key`, `settings.env` and `logs/`.
 
 **Running in the background.** Closing the window keeps the bot running in the tray or menu bar. Use *Quit*
-to stop it: the server finishes an in-flight cycle first, which can take up to about 2.5 minutes. Paper-mode
-positions are only protected while the app runs, and the app warns you about this when you quit. Alpaca
-positions keep their broker-side stop-loss orders. The tray menu also has *Copy Server URL* (for the Chrome
+to stop it. Before stopping, the server finishes the current cycle and any run-once, flatten or calibration you
+started from the app or the extension, which can take up to about 3½ minutes. If unfinished trading work ever
+has to be cancelled, the server exits with code 3 and the app tells you. Paper-mode positions are only protected
+while the app runs, and the app warns you about this when you quit. Alpaca positions keep their broker-side
+stop-loss orders. On Windows, the installer and log-off ask the app to stop gracefully too. The tray menu also has *Copy Server URL* (for the Chrome
 extension), *Open Data Folder*, *View Logs*, *Restart Bot Server*, *Start at Login* and *Keep computer awake*.
 
 **Forgot the password?**
@@ -252,8 +256,13 @@ Optional signing secrets for `.github/workflows/desktop.yml`:
   NSE…) or takes a typed one, and shows the bot's analysis and the research scorecard.
 
 **Install:** open `chrome://extensions` → Developer mode → **Load unpacked** → select `extension/`.
-**Connect:** in its settings, use the desktop app (`http://127.0.0.1:47821`, or *Find the desktop app*) or your
-own HTTPS server (Chrome asks for that site's permission), then sign in. Bot status, alerts and controls need an
+**Connect:** in its settings, use the desktop app or your own HTTPS server (Chrome asks for that site's
+permission), then sign in.
+- **Desktop app:** in the app's tray menu choose *Copy Pairing Code for the Chrome Extension*. Paste the code
+  into the extension's settings and press *Save code*, then pick the server (`http://127.0.0.1:47821`, or
+  *Find the desktop app*). The extension checks the code before it sends your password or tokens, so another
+  program on the same port can't pose as the app. The badge shows PAIR when no code is set and !! when a
+  server fails the check. Bot status, alerts and controls need an
 admin account; ticker analysis works for any account.
 
 It reads no page content: only the active tab's URL, and only when you open the popup. Tokens stay in the
@@ -317,6 +326,11 @@ See `.env.example`. Key settings: `TRADING_MODE`, `ALLOW_LIVE_TRADING`, `BOT_UNI
   so results are optimistic for small or illiquid names. ML and sentiment are not backtested (hence veto-only).
 - The walk-forward resets the high-water mark per fold; the daily-loss window follows the New York calendar date.
 - Live `costs` in the trade journal count commissions and fees; backtest `costs` also include spread and slippage.
+- When research data can't be fetched, the bot skips that stock rather than risk buying into earnings it can't
+  see; a small stock with no analyst coverage and no dividends may therefore never be bought.
+- Desktop app: the API rejects requests from other websites (403) and non-JSON state-changing requests (415);
+  `/docs` is disabled. A local program that knows your email can still use up that account's failed-login
+  allowance (10 a minute); existing sessions are unaffected.
 - Long-only. Shorting is intentionally not implemented (unbounded loss).
 - Yahoo Finance data is free but unofficial and can be delayed or rate-limited.
 - Alpaca supports US equities only; NSE symbols work in the dashboard, backtests and the paper broker.

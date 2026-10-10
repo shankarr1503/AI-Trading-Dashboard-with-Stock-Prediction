@@ -1,5 +1,6 @@
 """Desktop sidecar (backend/desktop.py) and DESKTOP_MODE behaviour. Offline; temp data dirs only."""
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -75,12 +76,14 @@ def test_settings_template_created_once_and_all_commented(tmp_path):
 def test_settings_env_never_overrides_the_environment(tmp_path):
     path = tmp_path / "settings.env"
     path.write_text("TRADING_MODE=alpaca_paper\nBOT_CYCLE_MINUTES=5\nAPP_ENV=development\n"
-                    "TRADEBOT_CONTROL_TOKEN=guessable\nDATABASE_URL=sqlite:///elsewhere.db\nJWT_SECRET_KEY=weak\n")
+                    "TRADEBOT_CONTROL_TOKEN=guessable\nDATABASE_URL=sqlite:///elsewhere.db\nJWT_SECRET_KEY=weak\n"
+                    "CORS_ORIGINS=https://evil.example\nTRADEBOT_PAIRING_SECRET=AAAAAAAAAAAAAAAAAAAA\n")
     environ = {"TRADING_MODE": "paper"}
     applied, problems = desktop.load_settings_env(path, environ)
     assert applied == ["BOT_CYCLE_MINUTES"]
     assert environ == {"TRADING_MODE": "paper", "BOT_CYCLE_MINUTES": "5"}
-    for key in ("APP_ENV", "TRADEBOT_CONTROL_TOKEN", "DATABASE_URL", "JWT_SECRET_KEY"):
+    for key in ("APP_ENV", "TRADEBOT_CONTROL_TOKEN", "DATABASE_URL", "JWT_SECRET_KEY", "CORS_ORIGINS",
+                "TRADEBOT_PAIRING_SECRET"):
         assert any(key in p for p in problems), key
     assert desktop.load_settings_env(tmp_path / "missing.env", {}) == ([], [])
 
@@ -111,8 +114,9 @@ def test_configure_environment(tmp_path):
     assert make_url(env["DATABASE_URL"]).database == (data_dir / "trading.db").as_posix()
     assert env["DATABASE_URL"].startswith("sqlite+aiosqlite:///")
     assert env["REDIS_URL"] == ""
-    assert "http://127.0.0.1:47822" in env["CORS_ORIGINS"].split(",")
+    assert env["CORS_ORIGINS"].split(",") == ["http://127.0.0.1:47822", "http://localhost:47822"]
     assert env["TRADEBOT_DATA_DIR"] == str(data_dir) and env["TRADEBOT_STATIC_DIR"] == str(tmp_path / "out")
+    assert env["TRADEBOT_PAIRING_SECRET"] == (data_dir / "pairing.key").read_text().strip()
 
     # A database / secret exported for another project never redirects the desktop app.
     stray = {"JWT_SECRET_KEY": "x" * 40, "DATABASE_URL": "postgresql://elsewhere/db", "REDIS_URL": "redis://r:6379",
@@ -120,8 +124,21 @@ def test_configure_environment(tmp_path):
     desktop.configure_environment(data_dir, 47821, None, stray)
     assert stray["JWT_SECRET_KEY"] == env["JWT_SECRET_KEY"]
     assert stray["DATABASE_URL"] == env["DATABASE_URL"] and stray["REDIS_URL"] == ""
-    assert stray["TRUSTED_PROXY_CIDRS"] == "" and stray["CORS_ORIGINS"] == "https://mine.example"
+    # Only the app's own origin may read API responses: the environment cannot widen CORS either.
+    assert stray["TRUSTED_PROXY_CIDRS"] == "" and stray["CORS_ORIGINS"] == "http://127.0.0.1:47821,http://localhost:47821"
+    assert stray["TRADEBOT_PAIRING_SECRET"] == env["TRADEBOT_PAIRING_SECRET"]       # one code per installation
     assert "TRADEBOT_STATIC_DIR" not in stray
+
+
+def test_pairing_code_is_generated_once_and_private(tmp_path):
+    code = desktop.ensure_pairing_secret(tmp_path)
+    assert len(code) == desktop.PAIRING_LENGTH == 20 and set(code) <= set(desktop.PAIRING_ALPHABET)
+    assert desktop.ensure_pairing_secret(tmp_path) == code
+    if POSIX:
+        assert (tmp_path / "pairing.key").stat().st_mode & 0o777 == 0o600
+    (tmp_path / "pairing.key").write_text("not-a-code\n")
+    replaced = desktop.ensure_pairing_secret(tmp_path)
+    assert replaced != code and len(replaced) == 20
 
 
 def test_desktop_env_is_not_development():
@@ -166,6 +183,46 @@ def test_port_selection_skips_busy_ports():
     for bad in ("abc", "70000", "-1"):
         with pytest.raises(desktop.StartupError):
             desktop.parse_port(bad)
+
+
+class _FakeWindowsSockets:
+    """Windows binding without Windows: exclusive binds of `held` fail `failures` times (the last run's TIME_WAIT)."""
+
+    def __init__(self, held, failures, listening=False):
+        self.held, self.failures, self.listening = held, failures, listening
+        self.calls = []
+
+    def open(self, host, port, mode):
+        self.calls.append((port, mode))
+        if port == self.held and mode == "exclusive" and self.failures > 0:
+            self.failures -= 1
+            raise OSError(10048, "WSAEADDRINUSE")
+        return ("socket", port, mode)
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(desktop, "_WINDOWS", True)
+        monkeypatch.setattr(desktop, "_open_listener", self.open)
+        monkeypatch.setattr(desktop, "_someone_listens", lambda host, port: self.listening and port == self.held)
+        monkeypatch.setattr(desktop.time, "sleep", lambda s: None)
+
+
+def test_windows_restart_keeps_the_port_despite_time_wait(monkeypatch):
+    # The previous run's connections block the exclusive bind for a moment: retried, same port.
+    fake = _FakeWindowsSockets(held=47821, failures=3)
+    fake.install(monkeypatch)
+    assert desktop.bind_port(47821) == ("socket", 47821, "exclusive")
+    assert [c for c in fake.calls if c[0] != 47821] == []
+
+    # Still blocked after the retries: bound without SO_EXCLUSIVEADDRUSE, still the same port.
+    fake = _FakeWindowsSockets(held=47821, failures=10**6)
+    fake.install(monkeypatch)
+    assert desktop.bind_port(47821, retry_seconds=0.05) == ("socket", 47821, "plain")
+
+    # Somebody really listens there: never shared, the next port is used at once.
+    fake = _FakeWindowsSockets(held=47821, failures=10**6, listening=True)
+    fake.install(monkeypatch)
+    assert desktop.bind_port(47821) == ("socket", 47822, "exclusive")
+    assert ("plain" not in {mode for _, mode in fake.calls})
 
 
 def test_one_instance_per_data_dir(tmp_path):
@@ -216,9 +273,12 @@ def client(desktop_app):
         yield c
 
 
-def _register(c, name):
+APP_WINDOW = {"X-Desktop-Token": TOKEN}      # what the Electron shell adds to its window's /auth/register
+
+
+def _register(c, name, headers=APP_WINDOW):
     return c.post("/auth/register", json={"email": f"{name}@example.com", "username": name,
-                                          "password": "correct-horse-battery"})
+                                          "password": "correct-horse-battery"}, headers=headers)
 
 
 def test_desktop_first_account_is_admin_then_registration_closes(client, monkeypatch):
@@ -232,6 +292,143 @@ def test_desktop_first_account_is_admin_then_registration_closes(client, monkeyp
     tok = client.post("/auth/login", json={"email": "owner@example.com", "password": "correct-horse-battery"}).json()
     status = client.get("/api/bot/status", headers={"Authorization": f"Bearer {tok['access_token']}"})
     assert status.status_code == 200 and status.json()["enabled"] is False     # the bot starts paused
+
+
+def _users(db_tables):
+    import sqlite3
+
+    url = make_url(settings.DATABASE_URL)
+    with sqlite3.connect(url.database) as db:
+        return db.execute("select email, is_superuser from users").fetchall()
+
+
+def test_first_account_can_only_be_created_from_the_app_window(client):
+    """SEC-1: before the owner registers, nobody else on the machine may claim the administrator account."""
+    for headers in ({}, {"X-Desktop-Token": "guess"}, {"X-Desktop-Token": TOKEN[:-1]}):
+        r = _register(client, "intruder", headers=headers)
+        assert r.status_code == 403 and r.json()["detail"] == "Create the first account in the AI Trading Bot app window"
+    # A web page's no-cors "simple" request: a body without Content-Type, its own Origin.
+    body = json.dumps({"email": "attacker@evilcorp.com", "username": "attacker", "password": "AttackerPassw0rd!!"})
+    blob = client.post("/auth/register", content=body, headers={"Content-Type": "", "Origin": "http://localhost:8123",
+                                                                 "Sec-Fetch-Site": "cross-site", **APP_WINDOW})
+    assert blob.status_code == 403
+    same_origin_no_type = client.post("/auth/register", content=body, headers={"Content-Type": "", **APP_WINDOW})
+    assert same_origin_no_type.status_code == 415
+    owner = _register(client, "owner")                                  # the owner, from the app window
+    assert owner.status_code == 201 and owner.json()["is_superuser"] is True
+    assert _register(client, "late").status_code == 403                 # then closed for everyone
+
+
+def test_first_account_without_a_shell_is_open_to_local_callers(db_tables, desktop_mode, monkeypatch):
+    """A sidecar started by hand from source (no control token) keeps the old first-come behaviour."""
+    from backend.main import create_app
+
+    monkeypatch.setattr(settings, "TRADEBOT_CONTROL_TOKEN", "")
+    with TestClient(create_app(), base_url="http://127.0.0.1:47821") as c:
+        first = _register(c, "dev", headers={})
+        assert first.status_code == 201 and first.json()["is_superuser"] is True
+        assert _register(c, "second", headers={}).status_code == 403
+
+
+def test_cross_site_requests_are_refused_before_anything_runs(client):
+    """SEC-3: CORS only hides responses; in desktop mode other web sites' requests must not run at all."""
+    assert _register(client, "owner").status_code == 201
+    login = {"email": "owner@example.com", "password": "correct-horse-battery"}
+    evil = [{"Origin": "https://evil.example"}, {"Origin": "http://127.0.0.1:8123"}, {"Origin": "null"},
+            {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"},
+            {"Origin": "http://localhost:8123", "Sec-Fetch-Site": "same-site"}]
+    for headers in evil:
+        assert client.post("/auth/login", json=login, headers=headers).status_code == 403, headers
+        assert client.get("/api/bot/status", headers=headers).status_code == 403, headers
+    # Allowed: the app's own origin, the Chrome extension, clients that send neither header.
+    own = client.post("/auth/login", json=login, headers={"Origin": "http://127.0.0.1:47821",
+                                                           "Sec-Fetch-Site": "same-origin"})
+    assert own.status_code == 200
+    ext = client.post("/auth/login", json=login, headers={"Origin": "chrome-extension://abcdefghijklmnop",
+                                                           "Sec-Fetch-Site": "none"})
+    assert ext.status_code == 200
+    assert client.post("/auth/login", json=login).status_code == 200
+    # A link from another site to the dashboard still opens it (static pages are not API paths).
+    page = client.get("/dashboard/", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"})
+    assert page.status_code == 200 and "DASHBOARD" in page.text
+    # Bodies must be JSON: text/plain and no Content-Type (no-cors fetch) are refused.
+    for content_type in ("", "text/plain", "application/x-www-form-urlencoded"):
+        r = client.post("/auth/login", content=json.dumps(login), headers={"Content-Type": content_type})
+        assert r.status_code == 415, content_type
+    token = own.json()["access_token"]
+    started = client.post("/api/bot/start", headers={"Authorization": f"Bearer {token}"})   # no body: fine
+    assert started.status_code == 200
+
+
+def test_local_floods_cannot_lock_the_owner_out(client):
+    """SEC-3: every desktop client is 127.0.0.1, so per-IP buckets would be one bucket anybody can exhaust."""
+    assert _register(client, "owner").status_code == 201
+    good = {"email": "owner@example.com", "password": "correct-horse-battery"}
+    for i in range(15):                                    # another local process spraying logins
+        assert client.post("/auth/login", json={"email": f"x{i}@example.com", "password": "nope"}).status_code == 401
+    for _ in range(35):                                    # ...and bogus refresh tokens
+        assert client.post("/auth/refresh", json={"refresh_token": "x"}).status_code == 401
+    pair = client.post("/auth/login", json=good)
+    assert pair.status_code == 200, pair.text
+    assert client.post("/auth/refresh", json={"refresh_token": pair.json()["refresh_token"]}).status_code == 200
+    # Unauthenticated floods use up the shared bucket; the owner's requests count against their account.
+    import backend.ratelimit as rl
+    auth = {"Authorization": f"Bearer {pair.json()['access_token']}"}
+    assert rl.rate_limit_key(_FakeRequest(auth)).startswith("user:")
+    assert rl.rate_limit_key(_FakeRequest({"Authorization": "Bearer forged.token.value"})) == "127.0.0.1"
+    # The owner's own sign-ins (app window, extension) never use up the allowance...
+    assert all(client.post("/auth/login", json=good).status_code == 200 for _ in range(12))
+    # ...guessing the owner's password is still limited, per account (failed attempts).
+    codes = [client.post("/auth/login", json={**good, "password": "wrong-guess"}).status_code for _ in range(11)]
+    assert codes[:10] == [401] * 10 and codes[10] == 429
+    assert client.post("/auth/login", json=good).status_code == 429       # no oracle while locked
+    assert client.post("/auth/login", json={"email": "other@example.com", "password": "x"}).status_code == 401
+
+
+class _FakeRequest:
+    def __init__(self, headers):
+        from starlette.datastructures import Headers
+
+        self.headers = Headers(headers)
+        self.client = type("C", (), {"host": "127.0.0.1"})()
+
+
+def test_api_docs_are_not_served_in_desktop_mode(client):
+    """SEC-5: Swagger UI / ReDoc would run CDN scripts on the origin that holds the dashboard's tokens."""
+    for path in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"):
+        r = client.get(path)
+        assert r.status_code == 404 and r.json() == {"detail": "Not Found"}, path
+        assert "cdn.jsdelivr.net" not in r.text
+
+
+def test_extension_pairing_proof(client, desktop_app, monkeypatch):
+    """SEC-2: the extension checks the server knows this installation's pairing code, bound to its own URL."""
+    import hashlib
+    import hmac
+
+    secret = "ABCDEFGHIJKLMNOPQRST"
+    monkeypatch.setattr(settings, "TRADEBOT_PAIRING_SECRET", secret)
+    from backend.main import create_app
+
+    app = create_app()
+    with TestClient(app, base_url="http://127.0.0.1:47821") as c:
+        nonce = "0123456789abcdef" * 4
+        assert c.get(f"/api/desktop/pair?nonce={nonce}").status_code == 503      # URL unknown: no answer
+        app.state.desktop_url = "http://127.0.0.1:47822"                          # the port it really bound
+        r = c.get(f"/api/desktop/pair?nonce={nonce}")
+        assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
+        body = r.json()
+        expected = hmac.new(secret.encode(), f"tradebot-pair-v1\nhttp://127.0.0.1:47822\n{nonce}".encode(),
+                            hashlib.sha256).hexdigest()
+        assert body == {"v": 1, "server": "http://127.0.0.1:47822", "proof": expected}
+        # A squatter relaying the challenge from 47821 gets a proof for 47822, not for the URL it serves.
+        for_47821 = hmac.new(secret.encode(), f"tradebot-pair-v1\nhttp://127.0.0.1:47821\n{nonce}".encode(),
+                             hashlib.sha256).hexdigest()
+        assert body["proof"] != for_47821
+        for bad in ("short", "zz" * 20, "a" * 200):
+            assert c.get(f"/api/desktop/pair?nonce={bad}").status_code == 422
+    # Without a pairing secret (or outside desktop mode) the endpoint does not exist.
+    assert client.get(f"/api/desktop/pair?nonce={'a' * 32}").status_code == 404
 
 
 def test_trusted_host_rejects_foreign_host_header(desktop_app):
@@ -258,7 +455,7 @@ def test_control_api_requires_token(client, desktop_app):
     assert body["open_positions"] == 0 and body["last_cycle_at"] is None
 
     r = client.post("/api/desktop/shutdown", headers={"X-Desktop-Token": TOKEN})
-    assert r.status_code == 202 and r.json() == {"stopping": True}
+    assert r.status_code == 202 and r.json() == {"stopping": True, "deadline_seconds": None}
     assert desktop_app.state.stops == ["control API"]
 
 
@@ -286,11 +483,22 @@ def test_static_frontend_served_and_api_wins(client):
     assert client.get("/health").json()["status"] == "healthy"
     assert client.get("/api/market/quote/bad$sym").status_code == 404 and "detail" in client.get(
         "/api/market/quote/bad$sym").json()
-    assert "swagger" in client.get("/docs").text.lower()
-    assert "/api/desktop/info" in client.get("/openapi.json").json()["paths"]
     assert client.post("/").status_code == 405
     # Static assets are not rate limited (every desktop request comes from 127.0.0.1).
     assert all(client.get("/_next/static/app.js").status_code == 200 for _ in range(150))
+
+
+def test_static_frontend_cache_headers(client, static_dir):
+    """After an upgrade the HTML must not come from Chromium's disk cache (old UI, missing chunks)."""
+    (static_dir / "dashboard" / "index.txt").write_text("RSC payload")
+    for path in ("/", "/dashboard/", "/dashboard/index.txt", "/no/such/page/"):
+        r = client.get(path)
+        assert r.headers["cache-control"] == "no-cache", path
+        assert "etag" in r.headers or r.status_code == 404, path
+    asset = client.get("/_next/static/app.js")
+    assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
+    revalidated = client.get("/dashboard/", headers={"If-None-Match": client.get("/dashboard/").headers["etag"]})
+    assert revalidated.status_code == 304 and revalidated.headers["cache-control"] == "no-cache"
 
 
 def test_desktop_websocket_streams_through_same_origin(client, monkeypatch):
@@ -300,10 +508,16 @@ def test_desktop_websocket_streams_through_same_origin(client, monkeypatch):
     # TestClient.websocket_connect resolves relative URLs against ws://testserver,
     # which TrustedHostMiddleware rejects: use the sidecar's own origin.
     url = f"ws://127.0.0.1:47821/ws/market/AAPL?token={tok['access_token']}"
-    with client.websocket_connect(url) as ws:
+    with client.websocket_connect(url, headers={"Origin": "http://127.0.0.1:47821"}) as ws:
         msg = ws.receive_json()
         assert msg["type"] == "quote" and msg["data"]["symbol"] == "AAPL"
         ws.send_json({"type": "unsubscribe"})
+    # Another web site cannot open the stream (cross-site WebSocket hijacking).
+    from starlette.websockets import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(url, headers={"Origin": "https://evil.example"}) as ws:
+            ws.receive_json()
 
 
 def test_nothing_changes_outside_desktop_mode(db_tables, static_dir, monkeypatch):
@@ -381,7 +595,7 @@ async def test_shutdown_waits_for_the_running_cycle(db_tables, desktop_mode, tmp
         assert (await http.get("/health")).status_code == 200
         assert (await http.post("/api/desktop/shutdown")).status_code == 403
         r = await http.post("/api/desktop/shutdown", headers={"X-Desktop-Token": TOKEN})
-        assert r.status_code == 202 and r.json() == {"stopping": True}
+        assert r.status_code == 202 and r.json() == {"stopping": True, "deadline_seconds": 210}
     assert await asyncio.wait_for(task, 30) == 0
     assert events == ["cycle start", "cycle end", "loop exit"]       # the in-flight cycle completed
     assert not (tmp_path / "server.json").exists()
@@ -403,8 +617,117 @@ async def test_shutdown_cancels_a_cycle_that_overruns_the_limit(db_tables, deskt
     app = create_app()
     task, ctx = await _serve_in_process(app, tmp_path, stuck_bot, bot_stop_timeout=0.3)
     app.state.request_shutdown("test")
-    assert await asyncio.wait_for(task, 30) == 0
+    assert await asyncio.wait_for(task, 30) == desktop.EXIT_CUT_OFF        # not a clean stop: say so
     assert events == ["cycle start", "cancelled"]
+
+
+async def test_urgent_shutdown_does_not_wait_for_the_cycle(db_tables, desktop_mode, tmp_path):
+    """Windows session end: the shell asks again with urgent=true, and the stop no longer waits 150 s."""
+    from backend.main import create_app
+
+    events = []
+
+    async def stuck_bot(stop):
+        events.append("cycle start")
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+
+    app = create_app()
+    task, ctx = await _serve_in_process(app, tmp_path, stuck_bot)          # the normal 150 s limit
+    async with httpx.AsyncClient(base_url=ctx.url) as http:
+        first = await http.post("/api/desktop/shutdown", headers={"X-Desktop-Token": TOKEN})
+        assert first.status_code == 202
+        await asyncio.sleep(0.3)
+        assert not task.done()                                              # waiting for the cycle
+        urgent = await http.post("/api/desktop/shutdown?urgent=true", headers={"X-Desktop-Token": TOKEN})
+        assert urgent.status_code == 202
+    assert await asyncio.wait_for(task, 30) == desktop.EXIT_CUT_OFF
+    assert events == ["cycle start", "cancelled"]
+
+
+def _inflight_app(events, seconds):
+    """A stand-in for the real routes: POST /api/bot/run-once and /flatten doing `seconds` of trading work."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    async def work(name):
+        events.append(f"{name} start")
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            events.append(f"{name} CANCELLED")
+            raise
+        events.append(f"{name} finished")
+        return {"status": "ok"}
+
+    async def run_once():
+        return await work("run-once")
+
+    async def flatten():
+        return await work("flatten")
+
+    app.add_api_route("/api/bot/run-once", run_once, methods=["POST"])
+    app.add_api_route("/api/bot/flatten", flatten, methods=["POST"])
+    return app
+
+
+async def _idle_bot(stop):
+    await stop.wait()
+
+
+async def _until(condition, timeout=20.0):
+    for _ in range(int(timeout / 0.02)):
+        if condition():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("condition not reached in time")
+
+
+async def test_shutdown_waits_for_bot_operations_started_through_the_api(tmp_path):
+    """SEC-4: a run-once / flatten in progress at quit finishes; new ones are refused meanwhile."""
+    events = []
+    app = _inflight_app(events, seconds=7)              # longer than the HTTP server's own 5 s grace
+    task, ctx = await _serve_in_process(app, tmp_path, _idle_bot)
+    async with httpx.AsyncClient(base_url=ctx.url, timeout=60) as http:
+        running = asyncio.create_task(http.post("/api/bot/run-once"))
+        await _until(lambda: "run-once start" in events)
+        app.state.request_shutdown("quit")
+        await asyncio.sleep(0.2)
+        refused = await http.post("/api/bot/run-once")
+        assert refused.status_code == 503 and "shutting down" in refused.json()["detail"]
+        flatten = await http.post("/api/bot/flatten")     # the panic button still works while stopping
+        assert flatten.status_code == 200
+        assert (await running).status_code == 200
+    assert await asyncio.wait_for(task, 60) == 0
+    assert events == ["run-once start", "flatten start", "run-once finished", "flatten finished"]
+    async with httpx.AsyncClient(base_url=ctx.url, timeout=5) as http:      # gone once stopped
+        with pytest.raises(httpx.HTTPError):
+            await http.post("/api/bot/flatten")
+
+
+async def test_bot_operation_overrunning_the_stop_limit_is_reported(tmp_path):
+    events = []
+    app = _inflight_app(events, seconds=3600)
+    task, ctx = await _serve_in_process(app, tmp_path, _idle_bot, bot_stop_timeout=0.5)
+    async with httpx.AsyncClient(base_url=ctx.url, timeout=60) as http:
+        running = asyncio.create_task(http.post("/api/bot/run-once"))
+        await _until(lambda: "run-once start" in events)
+        app.state.request_shutdown("quit")
+        assert await asyncio.wait_for(task, 60) == desktop.EXIT_CUT_OFF
+        with contextlib.suppress(httpx.HTTPError):
+            await running
+    assert events == ["run-once start", "run-once CANCELLED"]
+
+
+def test_shutdown_deadline_covers_the_worst_case():
+    worst = (desktop.BOT_STOP_TIMEOUT + desktop.BOT_CANCEL_WAIT + desktop.HTTP_STOP_WAIT + desktop.TASK_CANCEL_WAIT
+             + desktop.EXECUTOR_GRACE)
+    assert desktop.shutdown_deadline() >= worst and desktop.shutdown_deadline() == 210
+    assert desktop.shutdown_deadline(0.3) == 61
 
 
 # ─── the real process (python -m backend.desktop) ─────────────────────────────
@@ -634,7 +957,8 @@ async def test_sidecar_server_streams_websockets(db_tables, desktop_mode, tmp_pa
     try:
         async with httpx.AsyncClient(base_url=ctx.url) as http:
             user = {"email": "owner@example.com", "username": "owner", "password": "correct-horse-battery"}
-            assert (await http.post("/auth/register", json=user)).status_code == 201
+            assert (await http.post("/auth/register", json=user)).status_code == 403   # not from the app window
+            assert (await http.post("/auth/register", json=user, headers=APP_WINDOW)).status_code == 201
             tok = (await http.post("/auth/login", json={"email": user["email"],
                                                         "password": user["password"]})).json()
             assert (await http.get("/", headers={"Host": "attacker.test"})).status_code == 400

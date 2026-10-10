@@ -43,6 +43,21 @@ test('platform targets', () => {
   assert.equal(build.directories.buildResources, 'build');
 });
 
+test('the Windows installer asks a running app to quit gracefully before replacing it', () => {
+  assert.equal(build.nsis.include, 'build/installer.nsh');
+  const nsh = fs.readFileSync(path.join(root, build.nsis.include), 'utf8');
+  assert.match(nsh, /!macro customCheckAppRunning[\s\S]*!macroend/);
+  assert.match(nsh, /Exec `"\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}" --quit`/);
+  assert.match(nsh, /!insertmacro _CHECK_APP_RUNNING/); // then electron-builder's own check as the fallback
+  // The wait covers the sidecar's worst-case stop (lib/shutdown.js) plus the shell's margin.
+  const { shutdownWaitMs } = require('../lib/shutdown');
+  const wait = Number(nsh.match(/!define TRADEBOT_QUIT_WAIT_SECONDS (\d+)/)[1]);
+  assert.ok(wait * 1000 >= shutdownWaitMs(null), `${wait} s`);
+  // main.js turns --quit into a graceful quit of the running instance.
+  const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  assert.match(main, /argv\.includes\('--quit'\)\) quitUnattended/);
+});
+
 test('the macOS entitlements allow Electron and the bundled Python', () => {
   for (const key of ['entitlements', 'entitlementsInherit']) {
     const plist = fs.readFileSync(path.join(root, build.mac[key]), 'utf8');

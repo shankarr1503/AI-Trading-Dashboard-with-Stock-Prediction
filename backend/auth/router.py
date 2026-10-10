@@ -1,4 +1,6 @@
 """Authentication router — register, login, refresh token, current user."""
+import hmac
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,9 +11,16 @@ from backend.auth.utils import create_access_token, create_refresh_token, decode
 from backend.config import settings
 from backend.database.models import User
 from backend.database.session import get_db
-from backend.ratelimit import limiter
+from backend.ratelimit import account_limit_reached, desktop_mode, hit_account_limit, limiter
 
 router = APIRouter()
+
+# Desktop mode counts these per account instead of per IP (every client there is
+# 127.0.0.1: a shared bucket would let any local process lock the owner out).
+# Sign-ins count failed attempts only, so the owner's own sign-ins never use it up.
+LOGIN_LIMIT = "10/minute"
+REFRESH_LIMIT = "30/minute"
+FIRST_ACCOUNT_DENIED = "Create the first account in the AI Trading Bot app window"
 
 
 # Verifying against a real hash when the email is unknown keeps login timing
@@ -21,6 +30,21 @@ _DUMMY_HASH = get_password_hash("timing-equaliser-not-a-password")
 
 async def _user_count(db: AsyncSession) -> int:
     return int(await db.scalar(select(func.count()).select_from(User)) or 0)
+
+
+def _from_the_app_window(request: Request) -> bool:
+    """
+    The desktop shell adds its per-launch control token (X-Desktop-Token) to the
+    app window's own /auth/register requests, and to nothing else. Nobody else on
+    the machine knows it: not a web page, not another local user.
+    """
+    expected = settings.TRADEBOT_CONTROL_TOKEN
+    supplied = request.headers.get("x-desktop-token") or ""
+    return bool(expected) and hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _too_many(detail: str = "Too many attempts: try again in a minute") -> HTTPException:
+    return HTTPException(status_code=429, detail=detail, headers={"Retry-After": "60"})
 
 
 def _issue_tokens(user: User) -> Token:
@@ -33,7 +57,7 @@ def _issue_tokens(user: User) -> Token:
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-@limiter.limit("10/minute")
+@limiter.limit("10/minute", exempt_when=desktop_mode)
 async def register(request: Request, user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     """
     Register a new user. Registration never grants admin rights outside
@@ -43,11 +67,19 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
 
     The desktop app (DESKTOP_MODE) is single-user and only listens on 127.0.0.1:
     the first account is its owner and administrator, and registration closes
-    as soon as any account exists, whatever REGISTRATION_OPEN says.
+    as soon as any account exists, whatever REGISTRATION_OPEN says. When the
+    Electron shell started the server (TRADEBOT_CONTROL_TOKEN is set), that first
+    account can only be created from the app window: anything else on the machine
+    (a web page, another OS account) could otherwise claim the administrator
+    account before the owner. A sidecar started by hand without a control token
+    (development from source) accepts the first registration from anyone who can
+    reach 127.0.0.1.
     """
     if settings.DESKTOP_MODE:
         if await _user_count(db) > 0:
             raise HTTPException(status_code=403, detail="Registration is closed")
+        if settings.TRADEBOT_CONTROL_TOKEN and not _from_the_app_window(request):
+            raise HTTPException(status_code=403, detail=FIRST_ACCOUNT_DENIED)
     elif not settings.REGISTRATION_OPEN:
         raise HTTPException(status_code=403, detail="Registration is closed")
     email = user_data.email.strip().lower()
@@ -81,13 +113,18 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
 
 
 @router.post("/login", response_model=Token)
-@limiter.limit("10/minute")
+@limiter.limit(LOGIN_LIMIT, exempt_when=desktop_mode)
 async def login(request: Request, credentials: UserLogin, db: AsyncSession = Depends(get_db)):
-    """Login and receive JWT tokens."""
-    result = await db.execute(select(User).where(func.lower(User.email) == credentials.email.strip().lower()))
+    """Login and receive JWT tokens (desktop mode: at most LOGIN_LIMIT failed attempts per account)."""
+    email = credentials.email.strip().lower()
+    if settings.DESKTOP_MODE and account_limit_reached("login", email, LOGIN_LIMIT):
+        raise _too_many("Too many failed sign-in attempts for this account: try again in a minute")
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
     user = result.scalar_one_or_none()
     password_ok = verify_password(credentials.password, user.hashed_password if user else _DUMMY_HASH)
     if not user or not password_ok:
+        if settings.DESKTOP_MODE:
+            hit_account_limit("login", email, LOGIN_LIMIT)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -99,12 +136,18 @@ async def login(request: Request, credentials: UserLogin, db: AsyncSession = Dep
 
 
 @router.post("/refresh", response_model=Token)
-@limiter.limit("30/minute")
+@limiter.limit(REFRESH_LIMIT, exempt_when=desktop_mode)
 async def refresh_token(request: Request, body: RefreshTokenRequest, db: AsyncSession = Depends(get_db)):
-    """Exchange a refresh token for a new token pair."""
+    """
+    Exchange a refresh token for a new token pair. Desktop mode counts refreshes
+    per account; tokens without a valid signature are refused before counting, so
+    bogus refreshes cannot use up the owner's allowance.
+    """
     payload = decode_token(body.refresh_token)
     if not payload or payload.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+    if settings.DESKTOP_MODE and not hit_account_limit("refresh", str(payload.get("sub")), REFRESH_LIMIT):
+        raise _too_many()
     try:
         user = await db.get(User, int(payload.get("sub")))
     except (TypeError, ValueError):

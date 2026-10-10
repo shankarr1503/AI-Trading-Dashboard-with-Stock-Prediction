@@ -9,8 +9,11 @@
  * Options: --keep (keep the temporary folder), --timeout SECONDS (default 480),
  *          -- ARGS... (extra arguments for the app, e.g. --no-sandbox).
  *
- * Passes when the app prints SMOKE_OK, its result file says ok, it exits 0, and
- * the sidecar's log shows the graceful shutdown requested through the control API.
+ * Passes when the app prints SMOKE_OK, its result file says ok, it exits 0, the
+ * first (administrator) account was created through the app window's sign-up form
+ * (and refused from outside the window), and the sidecar's log shows the graceful
+ * shutdown requested through the control API after a second instance was started
+ * with --quit (what the Windows installer does).
  * On Linux without a display it runs under xvfb-run when available. As root on
  * Linux it adds --no-sandbox, without which Chromium refuses to start.
  */
@@ -152,6 +155,13 @@ if (!sawOk) problems.push('no SMOKE_OK line on stdout');
 if (!result || result.ok !== true) problems.push(`result file: ${result ? JSON.stringify(result) : 'missing'}`);
 if (!/Shutdown requested \(control API\)/.test(backendLog)) problems.push('backend.log has no "Shutdown requested (control API)"');
 if (!/Stopped \(control API\)/.test(backendLog)) problems.push('backend.log has no "Stopped (control API)"');
+if (!result || !result.account || result.account.admin !== true) problems.push('no administrator account was created in the app window');
+if (result && result.quitVia !== '--quit') problems.push(`quit through ${result && result.quitVia}, not a second instance with --quit`);
+const desktopLog = readText(path.join(userData, 'logs', 'desktop.log'));
+if (!/added the app window token to its account registration request/.test(desktopLog)) {
+  problems.push('desktop.log does not show the app window token being added to the registration request');
+}
+if (!/quitting: asked to quit by another process \(--quit\)/.test(desktopLog)) problems.push('desktop.log does not show the --quit request');
 
 const seconds = ((Date.now() - started) / 1000).toFixed(1);
 if (problems.length) {
@@ -162,6 +172,9 @@ if (problems.length) {
   console.error(`\nsmoke: kept ${workDir} for inspection`);
   process.exit(1);
 }
-console.log(`\nsmoke: PASSED in ${seconds} s (${result.url}, sidecar exit code ${result.backendExit.code}, graceful shutdown logged)`);
+console.log(
+  `\nsmoke: PASSED in ${seconds} s (${result.url}, administrator ${result.account.email} created in the app window, ` +
+    `quit via ${result.quitVia}, sidecar exit code ${result.backendExit.code}, graceful shutdown logged)`,
+);
 if (options.keep) console.log(`smoke: kept ${workDir}`);
 else fs.rmSync(workDir, { recursive: true, force: true });

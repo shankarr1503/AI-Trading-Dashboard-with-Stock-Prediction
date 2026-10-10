@@ -1,7 +1,7 @@
 // What the toolbar badge, its tooltip and the popup's state line show.
 // Pure functions over a "snapshot" collected by lib/poller.js:
 //
-//   { phase: 'disconnected' | 'no_access' | 'signed_out' | 'user' | 'admin',
+//   { phase: 'disconnected' | 'no_access' | 'unpaired' | 'untrusted' | 'signed_out' | 'user' | 'admin',
 //     server, user, bot (GET /api/bot/status body, admins only), error, at }
 
 import { modeLabel, money, pct, relativeTime, truncate } from './format.js';
@@ -20,6 +20,8 @@ export const BADGES = Object.freeze({
   stale:        { text: 'LATE', color: '#ffa502', textColor: DARK,  label: 'STALE' },
   disconnected: { text: 'DOWN', color: '#5a6478', textColor: WHITE, label: 'DISCONNECTED' },
   no_access:    { text: '!',    color: '#ffa502', textColor: DARK,  label: 'NO ACCESS' },
+  unpaired:     { text: 'PAIR', color: '#ffa502', textColor: DARK,  label: 'NOT PAIRED' },
+  untrusted:    { text: '!!',   color: '#ff4757', textColor: WHITE, label: 'UNVERIFIED SERVER' },
   signed_out:   { text: '?',    color: '#5a6478', textColor: WHITE, label: 'NOT SIGNED IN' },
   user:         { text: '',     color: '#5a6478', textColor: WHITE, label: 'CONNECTED' },
 });
@@ -113,6 +115,15 @@ export function describe(snapshot, now = Date.now()) {
       key = 'no_access';
       lines.push(`No permission to reach ${hostOf(server)}: open the extension options and save the server again.`);
       break;
+    case 'unpaired':
+      key = 'unpaired';
+      lines.push('Not paired with the desktop app: copy the pairing code from the app\'s tray menu into the extension options.');
+      break;
+    case 'untrusted':
+      key = 'untrusted';
+      lines.push(`The server at ${hostOf(server)} could not prove it is your AI Trading Bot app: nothing is sent to it.`);
+      if (snapshot.error) lines.push(truncate(snapshot.error, 160));
+      break;
     case 'signed_out':
       key = 'signed_out';
       lines.push('Not signed in: open the extension options to sign in.');
@@ -146,7 +157,7 @@ export function describe(snapshot, now = Date.now()) {
       break;
   }
   const badge = BADGES[key];
-  const heading = key === 'user' || key === 'signed_out' || key === 'disconnected' || key === 'no_access'
+  const heading = ['user', 'signed_out', 'disconnected', 'no_access', 'unpaired', 'untrusted'].includes(key)
     ? `AI Trading Bot: ${badge.label}`
     : 'AI Trading Bot';
   const title = [heading, ...lines, server ? `Server: ${server}` : ''].filter(Boolean).join('\n');

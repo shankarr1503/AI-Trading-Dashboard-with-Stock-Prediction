@@ -5,6 +5,12 @@
 // Both are bound to the server they were issued by and are never sent anywhere
 // else. A 401 triggers one refresh (shared by every concurrent request: single
 // flight) and one retry; if the refresh is refused the user is signed out.
+//
+// Desktop app on this computer: no password and no token is sent before the server
+// has proved it knows the app's pairing code (lib/pairing.js): before every sign-in,
+// and before authenticated requests at least once a minute.
+
+import { ensurePaired, PairingError } from './pairing.js';
 
 export const ACCESS_KEY = 'access';   // chrome.storage.session
 export const AUTH_KEY = 'auth';       // chrome.storage.local
@@ -14,7 +20,9 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 export class ApiError extends Error {
   /**
    * kind: 'network' (server unreachable or access not granted), 'timeout',
-   * 'auth' (not signed in / session ended), 'http' (any other non-2xx answer).
+   * 'auth' (not signed in / session ended), 'http' (any other non-2xx answer),
+   * 'pairing' (a server on this computer that has not proved it is the paired
+   * desktop app; detail: 'unpaired' or 'mismatch').
    */
   constructor(message, { status = 0, kind = 'http', detail = null } = {}) {
     super(message);
@@ -104,9 +112,13 @@ export function createTokenStore(chromeApi = globalThis.chrome, now = () => Date
 const refreshInFlight = new Map();
 
 export class ApiClient {
-  constructor({ baseUrl, tokens, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, now = () => Date.now() } = {}) {
+  /** pairingCode: the desktop app's pairing code from the settings ('' when none was entered). */
+  constructor({
+    baseUrl, tokens, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, now = () => Date.now(), pairingCode = '',
+  } = {}) {
     if (!baseUrl) throw new Error('ApiClient needs a baseUrl');
     this.baseUrl = String(baseUrl).replace(/\/+$/, '');
+    this.pairingCode = pairingCode || '';
     this.tokens = tokens || createTokenStore();
     this.fetch = fetchImpl || globalThis.fetch.bind(globalThis);
     this.timeoutMs = timeoutMs;
@@ -158,9 +170,29 @@ export class ApiClient {
     return data;
   }
 
+  /**
+   * Resolves when this server may receive a password or a token (see lib/pairing.js);
+   * rejects with an ApiError of kind 'pairing' (or 'network') otherwise.
+   */
+  async ensureTrusted({ force = false } = {}) {
+    try {
+      return await ensurePaired({
+        baseUrl: this.baseUrl, code: this.pairingCode, fetchImpl: this.fetch, now: this.now, force,
+      });
+    } catch (e) {
+      if (e instanceof PairingError) {
+        if (e.kind === 'network') throw new ApiError(e.message, { kind: 'network', detail: 'pairing' });
+        throw new ApiError(e.message, { kind: 'pairing', detail: e.kind });
+      }
+      throw e;
+    }
+  }
+
   /** A valid access token, refreshing first when it is missing or about to expire. */
   async accessToken() {
     const t = await this.tokens.load(this.baseUrl);
+    if (!t.refreshToken && !t.accessToken) throw new ApiError('Not signed in', { status: 401, kind: 'auth' });
+    await this.ensureTrusted();         // before any token leaves the browser
     if (t.accessToken && (!t.accessExpiresAt || t.accessExpiresAt > this.now())) return t.accessToken;
     if (!t.refreshToken) throw new ApiError('Not signed in', { status: 401, kind: 'auth' });
     return this.refresh(t.accessToken);
@@ -180,6 +212,7 @@ export class ApiClient {
     if (!pending) {
       pending = (async () => {
         if (!t.refreshToken) throw new ApiError('Not signed in', { status: 401, kind: 'auth' });
+        await this.ensureTrusted();
         let pair;
         try {
           pair = await this.send('/auth/refresh', { method: 'POST', body: { refresh_token: t.refreshToken } });
@@ -222,6 +255,7 @@ export class ApiClient {
   // ─── Auth ──────────────────────────────────────────────────────────────────
 
   async login(email, password) {
+    await this.ensureTrusted({ force: true });   // a password only goes to a server that proved who it is
     const pair = await this.send('/auth/login', {
       method: 'POST', body: { email: String(email || '').trim(), password: String(password || '') },
     });

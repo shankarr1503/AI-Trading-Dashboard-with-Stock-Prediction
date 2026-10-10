@@ -38,6 +38,22 @@
         </div>
         <p id="server-msg" class="msg" role="status" aria-live="polite"></p>
       </form>
+      <form id="pairing-form" class="stack pairing" novalidate>
+        <label for="pairing-code">Pairing code (desktop app)</label>
+        <input id="pairing-code" type="text" spellcheck="false" autocomplete="off" autocapitalize="characters"
+               placeholder="ABCD-EFGH-IJKL-MNOP-QRST">
+        <div class="actions">
+          <button id="pairing-save" class="btn" type="submit">Save code</button>
+        </div>
+        <p id="pairing-msg" class="msg" role="status" aria-live="polite"></p>
+        <p class="hint">
+          Any program on this computer could listen on the desktop app's port and pose as the app. The pairing
+          code lets the extension check that it is really talking to <strong>your</strong> app before it sends your
+          password or session to it. Copy it from the app's tray menu: <em>Copy Pairing Code for the Chrome
+          Extension</em>. It is needed for the desktop app (and checked for every server on this computer once
+          entered); servers on other machines are checked by their https:// certificate instead.
+        </p>
+      </form>
     </section>
 
     <section class="card" aria-labelledby="account-h">

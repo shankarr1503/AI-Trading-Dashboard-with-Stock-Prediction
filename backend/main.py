@@ -5,19 +5,27 @@ AI Trading Platform — FastAPI Application Entry Point
 (set by the desktop sidecar, backend/desktop.py) the same app additionally:
 
 * only answers requests whose Host is 127.0.0.1 / localhost (DNS-rebinding defence),
+* refuses API requests sent by other web sites and non-JSON request bodies
+  (DesktopOriginGuard: CORS alone only hides responses, it does not stop requests),
 * mounts the desktop control API at /api/desktop/* when TRADEBOT_CONTROL_TOKEN is set,
-* serves the static frontend export (TRADEBOT_STATIC_DIR) at "/" on the same origin.
+  and the extension pairing check at /api/desktop/pair when TRADEBOT_PAIRING_SECRET is,
+* serves the static frontend export (TRADEBOT_STATIC_DIR) at "/" on the same origin,
+  HTML revalidated on every load and content-hashed assets cached for good,
+* has no /docs, /redoc or /openapi.json (Swagger UI would load third-party scripts
+  on the origin whose localStorage holds the dashboard's tokens).
 
 Nothing changes when DESKTOP_MODE is false (credential query parameters are
 redacted from uvicorn's logs in every mode: see backend/logging_utils.py).
 """
+import hashlib
 import hmac
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -26,10 +34,12 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocketClose
 
 from backend.alerts.router import router as alerts_router
@@ -66,6 +76,21 @@ DESKTOP_ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 
 # Paths that belong to the API. In desktop mode everything else is the static frontend.
 API_PREFIXES = ("/auth", "/api", "/ws", "/health", "/docs", "/redoc", "/openapi.json")
+
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# Static export caching: Next.js content-hashes everything under /_next/static/, so
+# those files never change under the same URL. Everything else (the HTML pages, the
+# */index.txt RSC payloads, 404.html, favicon) keeps its URL across app versions and
+# must be revalidated (ETag) on every load: Chromium would otherwise serve an old
+# version from its disk cache for days after an upgrade (heuristic freshness).
+IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+REVALIDATE_CACHE = "no-cache"
+
+# Extension pairing (/api/desktop/pair): HMAC-SHA256(pairing code, message) with
+# PAIRING_CONTEXT, the server's own URL and the extension's nonce in the message.
+PAIRING_CONTEXT = "tradebot-pair-v1"
+_NONCE_RE = re.compile(r"^[0-9a-f]{32,128}$")
 
 
 @asynccontextmanager
@@ -134,17 +159,140 @@ async def desktop_info(request: Request, db: AsyncSession = Depends(get_db)):
 
 @desktop_router.post("/shutdown", status_code=202)
 @limiter.exempt
-async def desktop_shutdown(request: Request):
+async def desktop_shutdown(request: Request, urgent: bool = Query(False)):
     """
     Ask the sidecar to exit. The bot loop stops between cycles (a running cycle
     finishes first), then the HTTP server exits with code 0. The launcher injects
     the stop function as app.state.request_shutdown.
+
+    urgent=true (the operating system is ending the session and will not wait):
+    a running cycle is cancelled at its next step instead of being waited for.
+    Also valid after a normal request that is still waiting.
     """
     request_shutdown = getattr(request.app.state, "request_shutdown", None)
     if request_shutdown is None:
         raise HTTPException(status_code=503, detail="Shutdown is not available in this process")
     request_shutdown("control API")
-    return {"stopping": True}
+    if urgent:
+        request_shutdown("control API", True)       # a repeated request with force: do not wait
+    # The longest the sidecar may take to exit from now on (the shell waits that long
+    # plus a margin before it resorts to killing the process).
+    return {"stopping": True, "deadline_seconds": getattr(request.app.state, "shutdown_deadline", None)}
+
+
+# ─── Extension pairing (/api/desktop/pair) ────────────────────────────────────
+
+def pairing_proof(secret: str, server_url: str, nonce: str) -> str:
+    """
+    hex HMAC-SHA256 keyed with the pairing code over "tradebot-pair-v1\n<server url>\n<nonce>".
+    The server URL is this process's own (from the port it bound, never from the
+    request), so a program squatting the extension's configured port cannot relay
+    the extension's challenge to the real app and pass its answer off as its own.
+    """
+    message = f"{PAIRING_CONTEXT}\n{server_url}\n{nonce}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+pairing_router = APIRouter()
+
+
+@pairing_router.get("/pair")
+@limiter.exempt
+async def desktop_pair(request: Request, nonce: str = Query(..., min_length=32, max_length=128)):
+    """
+    Lets the Chrome extension check, before it sends a password or a token, that the
+    server on its configured address is this app: it sends a random nonce and
+    compares the proof with the one it computes from the pairing code the user
+    copied from the tray menu (Copy Pairing Code). No credentials involved.
+    """
+    nonce = nonce.lower()
+    if not _NONCE_RE.match(nonce):
+        raise HTTPException(status_code=422, detail="nonce must be 32-128 hex characters")
+    server_url = getattr(request.app.state, "desktop_url", None)
+    if not server_url:
+        raise HTTPException(status_code=503, detail="Pairing is not available in this process")
+    return JSONResponse(
+        {"v": 1, "server": server_url, "proof": pairing_proof(settings.TRADEBOT_PAIRING_SECRET, server_url, nonce)},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+# ─── Cross-site request guard (desktop) ───────────────────────────────────────
+
+def _origin_allowed(origin: str, host: str) -> bool:
+    """The app's own origin (as addressed: Host is already checked by TrustedHostMiddleware) or an extension."""
+    if origin.startswith("chrome-extension://"):
+        return True
+    if host and origin == f"http://{host}":
+        return True
+    return origin in settings.cors_origins
+
+
+def _has_body(headers: Headers) -> bool:
+    if "transfer-encoding" in headers:
+        return True
+    try:
+        return int(headers.get("content-length") or 0) > 0
+    except ValueError:
+        return True
+
+
+def _is_json(headers: Headers) -> bool:
+    media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    return media_type == "application/json" or (media_type.startswith("application/") and media_type.endswith("+json"))
+
+
+class DesktopOriginGuard:
+    """
+    Desktop mode only. The sidecar listens on 127.0.0.1, which every web page the
+    user opens can send requests to; CORS keeps those pages from *reading* the
+    answers, but the requests still run (and count against the shared 127.0.0.1
+    rate limits). Before anything else runs, this refuses:
+
+    * API requests and WebSocket handshakes from another web site: an Origin that
+      is neither the app's own origin nor a Chrome extension, or
+      Sec-Fetch-Site cross-site / same-site (403). Navigating to the dashboard
+      from a link stays possible (static pages are not API paths).
+    * State-changing API requests whose body is not JSON (415): fetch() in
+      no-cors mode can send a body without a Content-Type, which FastAPI would
+      otherwise parse as JSON.
+
+    The Electron window sends same-origin requests; the Chrome extension sends
+    Origin chrome-extension://... (Sec-Fetch-Site none); the shell's control
+    client and command-line tools send neither header.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        kind = scope["type"]
+        if kind not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        method = scope.get("method", "GET") if kind == "http" else "GET"
+        api = is_api_path(scope["path"])
+        if kind == "websocket" or api or method not in SAFE_METHODS:
+            headers = Headers(scope=scope)
+            origin = headers.get("origin")
+            site = headers.get("sec-fetch-site", "").lower()
+            foreign = origin is not None and not _origin_allowed(origin, headers.get("host", ""))
+            if not foreign and site in ("cross-site", "same-site"):
+                foreign = not (origin or "").startswith("chrome-extension://")
+            if foreign:
+                logger.warning("Refused a cross-site %s %s (Origin %s, Sec-Fetch-Site %s)",
+                               method, scope["path"], origin or "-", site or "-")
+                if kind == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                await JSONResponse({"detail": "Cross-site requests are not allowed"}, status_code=403)(
+                    scope, receive, send)
+                return
+            if api and method not in SAFE_METHODS and _has_body(headers) and not _is_json(headers):
+                await JSONResponse({"detail": "Send the request body as application/json"}, status_code=415)(
+                    scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 # ─── Static frontend (desktop) ────────────────────────────────────────────────
@@ -168,6 +316,13 @@ class FrontendFiles(StaticFiles):
         if scope["type"] == "http" and is_api_path(scope["path"]):
             raise StarletteHTTPException(status_code=404)
         await super().__call__(scope, receive, send)
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        hashed = path.replace(os.sep, "/").startswith("_next/static/")
+        response.headers["Cache-Control"] = IMMUTABLE_CACHE if hashed and response.status_code < 300 \
+            else REVALIDATE_CACHE
+        return response
 
 
 def _static_dir() -> Optional[str]:
@@ -200,6 +355,9 @@ AI-powered trading analytics and an agentic, risk-managed trading bot.
 """,
         version=settings.APP_VERSION,
         lifespan=lifespan,
+        # Desktop: no API docs. Swagger UI / ReDoc load scripts from a CDN, and on the
+        # app's origin they would run next to the dashboard's tokens in localStorage.
+        **({"docs_url": None, "redoc_url": None, "openapi_url": None} if settings.DESKTOP_MODE else {}),
     )
 
     app.state.limiter = limiter
@@ -207,6 +365,7 @@ AI-powered trading analytics and an agentic, risk-managed trading bot.
     app.state.request_shutdown = None
     app.state.desktop_url = None
     app.state.desktop_version = None
+    app.state.shutdown_deadline = None
 
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
@@ -219,7 +378,9 @@ AI-powered trading analytics and an agentic, risk-managed trading bot.
         allow_headers=["Authorization", "Content-Type"],
     )
     if settings.DESKTOP_MODE:
-        # Added last, so it is the outermost middleware and runs before anything else.
+        # Added last, so they are the outermost middleware: the Host check runs first,
+        # then the cross-site guard, both before CORS, rate limits and the routes.
+        app.add_middleware(DesktopOriginGuard)
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=DESKTOP_ALLOWED_HOSTS)
 
     app.add_exception_handler(Exception, unhandled_exception_handler)
@@ -236,6 +397,8 @@ AI-powered trading analytics and an agentic, risk-managed trading bot.
     app.include_router(research_router, prefix="/api/research", tags=["Equity Research"])
     if settings.DESKTOP_MODE and settings.TRADEBOT_CONTROL_TOKEN:
         app.include_router(desktop_router, prefix="/api/desktop", tags=["Desktop"])
+    if settings.DESKTOP_MODE and settings.TRADEBOT_PAIRING_SECRET:
+        app.include_router(pairing_router, prefix="/api/desktop", tags=["Desktop"])
 
     app.add_api_route("/health", health_check, methods=["GET"], tags=["Health"])
 

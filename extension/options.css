@@ -18,6 +18,9 @@ code { background: var(--panel); border: 1px solid var(--border); border-radius:
 .stack label { color: var(--muted); font-size: 12px; margin-top: 4px; }
 .stack .actions { margin-top: 8px; }
 
+.pairing { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.pairing input { font-family: var(--mono); letter-spacing: 0.04em; }
+
 .signed-in { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .signed-in p { margin: 0; }
 

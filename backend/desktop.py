@@ -21,24 +21,34 @@ Environment (real environment variables always win over settings.env):
     TRADEBOT_PORT           first port to try (default 47821, then the next 20; 0 = any free port)
     TRADEBOT_DATA_DIR       data directory (default: per-user, see default_data_dir())
     TRADEBOT_CONTROL_TOKEN  enables POST /api/desktop/shutdown and GET /api/desktop/info
-                            (header X-Desktop-Token); the shell generates one per launch
+                            (header X-Desktop-Token); the shell generates one per launch.
+                            While no account exists, POST /auth/register needs it too: the
+                            shell adds it to its own window's registration request only, so
+                            the first (administrator) account can only be created in the app.
+                            Without it (started by hand from source) anyone who can reach
+                            127.0.0.1 may create the first account.
     TRADEBOT_STATIC_DIR     static frontend export to serve (default: the bundled one)
     TRADEBOT_NO_BOT=1       same as --no-bot: serve the app without the bot loop
     TRADEBOT_WATCH_PARENT=0 do not exit when the launching process disappears
     TRADEBOT_LOG_STDERR=0   log only to the log file
 
-DATABASE_URL, JWT_SECRET_KEY, APP_ENV, REDIS_URL and the other keys in
-PROTECTED_KEYS are always set by the launcher, never taken from settings.env or
+DATABASE_URL, JWT_SECRET_KEY, APP_ENV, REDIS_URL, CORS_ORIGINS and the other keys
+in PROTECTED_KEYS are always set by the launcher, never taken from settings.env or
 the environment.
 
 The data directory holds trading.db (SQLite, migrated with Alembic on every
-start), secret.key (generated JWT secret), settings.env (user-editable
-KEY=VALUE settings, created from a commented template), server.json (url, port
-and pid of the running instance) and logs/.
+start), secret.key (generated JWT secret), pairing.key (the code that pairs the
+Chrome extension with this app: GET /api/desktop/pair), settings.env
+(user-editable KEY=VALUE settings, created from a commented template),
+server.json (url, port and pid of the running instance) and logs/.
 
 Shutdown (control API, SIGINT/SIGTERM, or the launching process exiting) stops
-the bot loop *between* cycles: a cycle in progress finishes first (at most
-BOT_STOP_TIMEOUT seconds), then the HTTP server stops and the process exits 0.
+the bot loop *between* cycles: a cycle in progress finishes first, and so do bot
+operations started through the API (run-once, flatten, calibrate), all within
+BOT_STOP_TIMEOUT seconds; then the HTTP server stops. The exit code is 0, or
+EXIT_CUT_OFF (3) when a cycle or an operation overran that limit and had to be
+cancelled. POST /api/desktop/shutdown answers with the longest the whole stop can
+take (deadline_seconds).
 
 Apart from backend.logging_utils, nothing from backend.* is imported at module
 level: the environment has to be prepared before backend.config reads it.
@@ -52,6 +62,7 @@ import getpass
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import secrets
@@ -59,6 +70,7 @@ import signal
 import socket
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, MutableMapping, Optional, Tuple
@@ -70,8 +82,14 @@ APP_NAME = "AI Trading Bot"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 47821
 PORT_FALLBACKS = 20                 # 47821 busy → try 47822..47841
-BOT_STOP_TIMEOUT = 150.0            # seconds an in-flight cycle may take to finish on shutdown
+PORT_RETRY_SECONDS = 5.0            # Windows: how long a port held only by the last run's connections is retried
+BOT_STOP_TIMEOUT = 150.0            # seconds an in-flight cycle / bot operation may take to finish on shutdown
+BOT_CANCEL_WAIT = 15.0              # then, seconds a cancelled cycle gets to unwind
 HTTP_GRACEFUL_TIMEOUT = 5           # seconds open connections (WebSockets) get to close
+HTTP_STOP_WAIT = HTTP_GRACEFUL_TIMEOUT + 25     # the most the HTTP server's own shutdown may take
+TASK_CANCEL_WAIT = 5.0              # leftover asyncio tasks at exit
+EXECUTOR_GRACE = 10.0               # blocking calls still running in worker threads at exit
+EXIT_CUT_OFF = 3                    # stopped, but a cycle or bot operation had to be cancelled
 PARENT_POLL_SECONDS = 2.0
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 5
@@ -83,8 +101,12 @@ VERSION_FILE = "tradebot_version.txt"   # written into the PyInstaller bundle by
 # shell): settings.env cannot change them, and for most of them neither can the
 # environment. The database and the JWT secret always live in the data directory.
 PROTECTED_KEYS = frozenset({"DESKTOP_MODE", "APP_ENV", "DB_AUTO_CREATE", "TRADEBOT_DATA_DIR",
-                            "TRADEBOT_CONTROL_TOKEN", "REDIS_URL", "DATABASE_URL", "JWT_SECRET_KEY",
-                            "TRUSTED_PROXY_CIDRS", "BACKEND_HOST", "BACKEND_PORT"})
+                            "TRADEBOT_CONTROL_TOKEN", "TRADEBOT_PAIRING_SECRET", "REDIS_URL", "DATABASE_URL",
+                            "JWT_SECRET_KEY", "TRUSTED_PROXY_CIDRS", "CORS_ORIGINS", "BACKEND_HOST",
+                            "BACKEND_PORT"})
+
+PAIRING_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"     # base32: no 0/1/8/9 to confuse with O/I/B/g
+PAIRING_LENGTH = 20                                      # 100 bits
 
 SETTINGS_TEMPLATE = """\
 # AI Trading Bot settings
@@ -282,6 +304,24 @@ def ensure_secret(data_dir: Path) -> str:
     return secret
 
 
+def ensure_pairing_secret(data_dir: Path) -> str:
+    """
+    The pairing code of this installation (<data dir>/pairing.key, mode 0600): 20
+    base32 characters, generated once. The tray menu copies it (Copy Pairing Code)
+    for the Chrome extension, which uses it to check that the server on its
+    configured port is this app before it sends any credentials.
+    """
+    path = data_dir / "pairing.key"
+    with contextlib.suppress(FileNotFoundError):
+        existing = path.read_text(encoding="utf-8").strip().upper()
+        if len(existing) >= PAIRING_LENGTH and all(c in PAIRING_ALPHABET for c in existing):
+            return existing
+        logger.warning("pairing.key is unusable; generating a new one - pair the Chrome extension again")
+    code = "".join(secrets.choice(PAIRING_ALPHABET) for _ in range(PAIRING_LENGTH))
+    atomic_write(path, code + "\n", mode=0o600)
+    return code
+
+
 # ─── settings.env ─────────────────────────────────────────────────────────────
 
 def parse_env_text(text: str) -> Tuple[Dict[str, str], List[str]]:
@@ -367,12 +407,15 @@ def configure_environment(data_dir: Path, port: int, static_dir: Optional[Path] 
     environ["BACKEND_HOST"] = HOST
     environ["BACKEND_PORT"] = str(port)
     environ["JWT_SECRET_KEY"] = ensure_secret(data_dir)
+    environ["TRADEBOT_PAIRING_SECRET"] = ensure_pairing_secret(data_dir)
     environ["DATABASE_URL"] = sqlite_url(data_dir / "trading.db")
     environ["REDIS_URL"] = ""                  # in-process cache and rate limits (no redis in the bundle)
     # No reverse proxy in front of the sidecar: never take the client address from
     # X-Real-IP (any local process could otherwise dodge the login rate limit).
     environ["TRUSTED_PROXY_CIDRS"] = ""
-    environ.setdefault("CORS_ORIGINS", f"http://{HOST}:{port},http://localhost:{port}")
+    # Only the app's own origin may read API responses (the Chrome extension needs no
+    # CORS: it has host permissions). Never widened by settings.env or the environment.
+    environ["CORS_ORIGINS"] = f"http://{HOST}:{port},http://localhost:{port}"
     # Every request (UI, extension) comes from 127.0.0.1, so the per-IP limit is shared.
     environ.setdefault("RATE_LIMIT_DEFAULT", "600/minute")
     environ.setdefault("LOG_LEVEL", "INFO")
@@ -430,34 +473,91 @@ def _someone_listens(host: str, port: int) -> bool:
             return False
 
 
-def bind_port(preferred: int = DEFAULT_PORT, host: str = HOST, fallbacks: int = PORT_FALLBACKS) -> socket.socket:
+_WINDOWS = os.name == "nt"
+
+
+def _open_listener(host: str, port: int, mode: str) -> socket.socket:
+    """
+    A listening socket on host:port. mode: "reuse" (POSIX: SO_REUSEADDR, so a restart
+    is not blocked by the last run's TIME_WAIT connections), "exclusive" (Windows:
+    SO_EXCLUSIVEADDRUSE, nobody can bind the port next to us) or "plain" (Windows,
+    no option: still protected from other accounts by Windows' socket security).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if mode == "exclusive":
+            sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", ~socket.SO_REUSEADDR), 1)
+        elif mode == "reuse":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.listen(128)
+        sock.set_inheritable(False)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+def _bind_windows(host: str, port: int, retry_seconds: float) -> socket.socket:
+    """
+    Windows: SO_EXCLUSIVEADDRUSE (SO_REUSEADDR would let us steal a port that is in
+    use). An exclusive bind also fails while connections the previous run accepted
+    on the port linger (TIME_WAIT, up to minutes), which would move every quick
+    restart to the next port, sign the dashboard out (new origin) and disconnect the
+    Chrome extension. So when nothing listens there, retry for a few seconds, then
+    bind without the exclusive option (a TIME_WAIT connection does not block that).
+    """
+    try:
+        return _open_listener(host, port, "exclusive")
+    except OSError as first:
+        if retry_seconds <= 0 or _someone_listens(host, port):
+            raise
+        error: OSError = first
+    deadline = time.monotonic() + retry_seconds
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        try:
+            return _open_listener(host, port, "exclusive")
+        except OSError as e:
+            error = e
+        if _someone_listens(host, port):
+            raise error
+    try:
+        sock = _open_listener(host, port, "plain")
+    except OSError:
+        raise error from None
+    logger.info("Port %d is still held by closed connections of the previous run; bound it without "
+                "SO_EXCLUSIVEADDRUSE", port)
+    return sock
+
+
+def bind_port(preferred: int = DEFAULT_PORT, host: str = HOST, fallbacks: int = PORT_FALLBACKS,
+              retry_seconds: float = PORT_RETRY_SECONDS) -> socket.socket:
     """
     Bind and listen on the first free port of preferred..preferred+fallbacks (0 = any
     free port). Handing the bound socket to uvicorn leaves no window in which another
-    process could take the port between choosing and serving it.
+    process could take the port between choosing and serving it. The preferred port
+    is retried for up to retry_seconds when only the last run's connections hold it
+    (Windows).
     """
     candidates = [0] if preferred == 0 else [p for p in range(preferred, preferred + fallbacks + 1) if p <= 65535]
     last_error: Optional[OSError] = None
     for port in candidates:
-        if port and os.name != "nt" and _someone_listens(host, port):
-            # SO_REUSEADDR (below) keeps restarts on the same port despite TIME_WAIT,
-            # but on macOS/BSD it would also let us bind 127.0.0.1:port next to a
-            # server listening on 0.0.0.0:port and shadow it. Skip ports in use.
+        if _WINDOWS:
+            try:
+                return _bind_windows(host, port, retry_seconds if port and port == preferred else 0)
+            except OSError as e:
+                last_error = e
+                continue
+        if port and _someone_listens(host, port):
+            # SO_REUSEADDR keeps restarts on the same port despite TIME_WAIT, but on
+            # macOS/BSD it would also let us bind 127.0.0.1:port next to a server
+            # listening on 0.0.0.0:port and shadow it. Skip ports in use.
             last_error = OSError(f"port {port} is in use")
             continue
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            if os.name == "nt":
-                # On Windows SO_REUSEADDR would let us steal a port that is in use.
-                sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", 0xFFFFFFFB), 1)
-            else:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((host, port))
-            sock.listen(128)
-            sock.set_inheritable(False)
-            return sock
+            return _open_listener(host, port, "reuse")
         except OSError as e:
-            sock.close()
             last_error = e
     raise StartupError(f"No free port on {host} in {candidates[0]}-{candidates[-1]} ({last_error})")
 
@@ -761,7 +861,14 @@ async def _default_bot(stop: asyncio.Event) -> None:
     await run_forever(stop, TradingAgent(owner="desktop"))
 
 
-async def _stop_bot(task: asyncio.Task, shutdown: Shutdown, timeout: float) -> None:
+def shutdown_deadline(bot_stop_timeout: float = BOT_STOP_TIMEOUT) -> int:
+    """The longest a stop can take, from the request to the process exit (seconds)."""
+    return int(math.ceil(bot_stop_timeout + BOT_CANCEL_WAIT + HTTP_STOP_WAIT + TASK_CANCEL_WAIT + EXECUTOR_GRACE))
+
+
+async def _stop_bot(task: asyncio.Task, shutdown: Shutdown, timeout: float) -> bool:
+    """Stop the bot loop between cycles. True when a cycle overran `timeout` and was cancelled."""
+    cancelled = False
     if not task.done():
         logger.info("Stopping the trading bot (a cycle in progress may take up to %ds to finish)", int(timeout))
         forced = asyncio.ensure_future(shutdown.forced.wait())
@@ -770,9 +877,81 @@ async def _stop_bot(task: asyncio.Task, shutdown: Shutdown, timeout: float) -> N
         if not task.done():
             logger.warning("Trading cycle still running: cancelling it")
             task.cancel()
-            await asyncio.wait({task}, timeout=15)
+            cancelled = True
+            await asyncio.wait({task}, timeout=BOT_CANCEL_WAIT)
     if task.done() and not task.cancelled() and task.exception() is not None:
         logger.error("Trading bot loop failed", exc_info=task.exception())
+    return cancelled
+
+
+class BotOperations:
+    """
+    ASGI wrapper around the app: tracks the bot operations started through the API
+    (POST /api/bot/run-once, /flatten, /calibrate), which run trading work inside
+    the request itself. A stop waits for them like for the bot loop's own cycle,
+    instead of letting the HTTP server cancel them a few seconds after the stop.
+    Once a stop is requested, new run-once / calibrate requests get 503; a panic
+    flatten is still accepted while the stop waits (within the same time limit; its
+    request is stored durably and finished at the next start if it cannot complete
+    now), and refused once the HTTP server is about to stop.
+    """
+
+    TRACKED = frozenset({"/api/bot/run-once", "/api/bot/flatten", "/api/bot/calibrate"})
+    ALWAYS_ACCEPTED = frozenset({"/api/bot/flatten"})
+
+    def __init__(self, app, shutdown: Shutdown):
+        self.app = app
+        self.shutdown = shutdown
+        self.closed = False
+        self._active: set = set()
+
+    @property
+    def active(self) -> int:
+        return len(self._active)
+
+    async def __call__(self, scope, receive, send) -> None:
+        path = scope.get("path", "")
+        if scope["type"] != "http" or scope.get("method") != "POST" or path not in self.TRACKED:
+            await self.app(scope, receive, send)
+            return
+        if self.closed or (self.shutdown.requested.is_set() and path not in self.ALWAYS_ACCEPTED):
+            body = json.dumps({"detail": "The app is shutting down: try again once it has restarted"}).encode()
+            await send({"type": "http.response.start", "status": 503,
+                        "headers": [(b"content-type", b"application/json"), (b"retry-after", b"30"),
+                                    (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        done = asyncio.get_running_loop().create_future()
+        self._active.add(done)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self._active.discard(done)
+            if not done.done():
+                done.set_result(None)
+
+    async def drain(self, timeout: float, forced: asyncio.Event) -> bool:
+        """Wait up to `timeout` s for the running operations, then refuse new ones. True when none is left."""
+        if self._active:
+            logger.info("Waiting for %d bot operation(s) started from the app or the extension", len(self._active))
+        loop = asyncio.get_running_loop()
+        end = loop.time() + timeout
+        forced_wait = asyncio.ensure_future(forced.wait())
+        try:
+            while self._active and not forced.is_set():
+                remaining = end - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.wait({*self._active, forced_wait}, timeout=remaining,
+                                   return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            forced_wait.cancel()
+            self.closed = True
+        if self._active:
+            logger.warning("%d bot operation(s) still running after the stop limit: cancelling them",
+                           len(self._active))
+            return False
+        return True
 
 
 def _remove_server_file(path: Path) -> None:
@@ -791,10 +970,12 @@ async def serve_app(app, sock: socket.socket, ctx: LaunchContext, bot_runner: Op
     app.state.request_shutdown = shutdown.request
     app.state.desktop_url = ctx.url
     app.state.desktop_version = ctx.version
+    app.state.shutdown_deadline = shutdown_deadline(ctx.bot_stop_timeout)
     if ctx.install_signals:
         install_signal_handlers(loop, shutdown)
 
-    server = _make_server(app, ctx.port)
+    operations = BotOperations(app, shutdown)
+    server = _make_server(operations, ctx.port)
     server_task = asyncio.create_task(server.serve(sockets=[sock]), name="http-server")
     while not server.started:
         if server_task.done():
@@ -827,16 +1008,23 @@ async def serve_app(app, sock: socket.socket, ctx: LaunchContext, bot_runner: Op
         logger.error("The HTTP server stopped unexpectedly")
         exit_code = 1
 
-    # 1) The bot: let a cycle in progress finish, so no order is cut off mid-flight.
+    # 1) The bot: let a cycle in progress finish, and bot operations started through
+    #    the API too (one shared time limit), so no order is cut off mid-flight.
     bot_stop.set()
+    stop_deadline = loop.time() + ctx.bot_stop_timeout
+    cut_off = False
     if bot_task is not None:
-        await _stop_bot(bot_task, shutdown, ctx.bot_stop_timeout)
+        cut_off = await _stop_bot(bot_task, shutdown, ctx.bot_stop_timeout)
+    if not await operations.drain(max(0.0, stop_deadline - loop.time()), shutdown.forced):
+        cut_off = True
+    if cut_off and exit_code == 0:
+        exit_code = EXIT_CUT_OFF
     # 2) The HTTP server: stop accepting, give open connections a moment, run lifespan shutdown.
     server.should_exit = True
     if shutdown.forced.is_set():
         server.force_exit = True
     try:
-        await asyncio.wait_for(asyncio.shield(server_task), timeout=HTTP_GRACEFUL_TIMEOUT + 25)
+        await asyncio.wait_for(asyncio.shield(server_task), timeout=HTTP_STOP_WAIT)
     except asyncio.TimeoutError:
         logger.error("The HTTP server did not stop in time")
         server_task.cancel()
@@ -848,7 +1036,8 @@ async def serve_app(app, sock: socket.socket, ctx: LaunchContext, bot_runner: Op
         if task is not None:
             task.cancel()
     _remove_server_file(server_file)
-    logger.info("Stopped (%s)", shutdown.reason or "server exit")
+    logger.info("Stopped (%s)%s", shutdown.reason or "server exit",
+                " after cancelling unfinished trading work" if exit_code == EXIT_CUT_OFF else "")
     return exit_code
 
 
@@ -878,7 +1067,7 @@ def _configure(data_dir: Path, port: int):
     return load_settings()
 
 
-def run_until_done(main: Awaitable[int], executor_grace: float = 10.0) -> int:
+def run_until_done(main: Awaitable[int], executor_grace: float = EXECUTOR_GRACE) -> int:
     """
     Like asyncio.run, but a blocking call still running in a worker thread (a slow
     market-data request) cannot hold up the exit for long: Python 3.11 would wait
@@ -895,7 +1084,7 @@ def run_until_done(main: Awaitable[int], executor_grace: float = 10.0) -> int:
             for task in pending:
                 task.cancel()
             if pending:
-                loop.run_until_complete(asyncio.wait(pending, timeout=5))
+                loop.run_until_complete(asyncio.wait(pending, timeout=TASK_CANCEL_WAIT))
             loop.run_until_complete(loop.shutdown_asyncgens())
             try:
                 loop.run_until_complete(asyncio.wait_for(loop.shutdown_default_executor(), executor_grace))
@@ -922,8 +1111,12 @@ def cmd_serve(args) -> int:
             lock = None
             raise StartupError(f"{APP_NAME} is already running with the data directory {data_dir}")
         port_arg = args.port if args.port is not None else os.environ.get("TRADEBOT_PORT")
-        sock = bind_port(parse_port(None if port_arg is None else str(port_arg)))
+        preferred = parse_port(None if port_arg is None else str(port_arg))
+        sock = bind_port(preferred)
         port = sock.getsockname()[1]
+        if preferred and port != preferred:
+            logger.warning("Port %d is in use by another program: serving on %d instead. The Chrome extension "
+                           "and open dashboard tabs need the new address.", preferred, port)
         url = f"http://{HOST}:{port}"
         settings = _configure(data_dir, port)
         logger.info("%s backend starting: data=%s, mode=%s, frontend=%s", APP_NAME, data_dir, settings.TRADING_MODE,

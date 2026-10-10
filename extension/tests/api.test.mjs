@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { ACCESS_KEY, ApiClient, ApiError, AUTH_KEY, createTokenStore, errorDetail } from '../lib/api.js';
-import { ADMIN, fakeFetch, makeChrome } from './fake-chrome.mjs';
+import { ADMIN, fakeFetch, makeChrome, PAIRING_CODE } from './fake-chrome.mjs';
 
 const BASE = 'http://127.0.0.1:47821';
 
@@ -14,7 +14,7 @@ function setup(routes, { now = () => 1_000_000 } = {}) {
   const chrome = makeChrome();
   const tokens = createTokenStore(chrome, now);
   const fetchImpl = fakeFetch(routes);
-  const client = new ApiClient({ baseUrl: BASE, tokens, fetchImpl, now });
+  const client = new ApiClient({ baseUrl: BASE, tokens, fetchImpl, now, pairingCode: PAIRING_CODE });
   return { chrome, tokens, fetchImpl, client };
 }
 
@@ -36,7 +36,7 @@ test('a trailing slash in the base URL is tolerated and paths are encoded', asyn
   const chrome = makeChrome();
   const tokens = createTokenStore(chrome);
   const fetchImpl = fakeFetch(() => ({ body: {} }));
-  const client = new ApiClient({ baseUrl: `${BASE}/`, tokens, fetchImpl });
+  const client = new ApiClient({ baseUrl: `${BASE}/`, tokens, fetchImpl, pairingCode: PAIRING_CODE });
   await tokens.save(BASE, pair(1));
   await client.analyze('^GSPC');
   await client.fundamentals('BRK-B');

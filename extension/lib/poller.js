@@ -26,6 +26,19 @@ export async function collectSnapshot({ server, client, chromeApi, now = Date.no
     snap.error = e.kind === 'network' ? null : e.message;
     return snap;
   }
+  // The desktop app on this computer must prove it is the paired app (signed in or
+  // not: an impostor on the app's port is worth a warning either way).
+  try {
+    await client.ensureTrusted();
+  } catch (e) {
+    if (e.kind === 'pairing') {
+      snap.phase = e.detail === 'unpaired' ? 'unpaired' : 'untrusted';
+      snap.error = e.message;
+    } else {
+      snap.error = e.kind === 'network' ? null : e.message;
+    }
+    return snap;
+  }
   if (!(await client.isSignedIn())) {
     snap.phase = 'signed_out';
     return snap;
@@ -90,8 +103,16 @@ async function notify(chromeApi, n) {
 export async function runPoll({ chromeApi = globalThis.chrome, fetchImpl, now = () => Date.now() } = {}) {
   const settings = await getSettings(chromeApi);
   const server = settings.serverUrl;
-  const client = new ApiClient({ baseUrl: server, tokens: createTokenStore(chromeApi, now), fetchImpl, now });
+  const client = new ApiClient({
+    baseUrl: server, tokens: createTokenStore(chromeApi, now), fetchImpl, now, pairingCode: settings.pairingCode,
+  });
   const snapshot = await collectSnapshot({ server, client, chromeApi, now: now() });
+  // The server or pairing code may have changed while we were polling: a result
+  // for the old configuration must not overwrite the badge of the new one.
+  const current = await getSettings(chromeApi);
+  if (current.serverUrl !== server || current.pairingCode !== settings.pairingCode) {
+    return { snapshot, display: null, notifications: [], stale: true };
+  }
   const display = describe(snapshot, now());
   await applyBadge(chromeApi, display);
 

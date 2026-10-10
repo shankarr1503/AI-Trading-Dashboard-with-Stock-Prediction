@@ -139,8 +139,32 @@ function buildSidecarEnv(baseEnv, { port, dataDir, token, extraEnv = {} }) {
   return env;
 }
 
+/**
+ * The note shown when the sidecar could not get the port it was asked for (another
+ * program holds it) and serves on another one, or null. The Chrome extension and
+ * any open dashboard tab still point at the old address, and whatever holds that
+ * port may pose as this app: the extension's pairing check stops it there.
+ */
+function portChangeNotice(requestedPort, url) {
+  const wanted = Number(requestedPort);
+  let actual;
+  try {
+    actual = Number(new URL(url).port);
+  } catch {
+    return null;
+  }
+  if (!Number.isInteger(wanted) || wanted <= 0 || !actual || actual === wanted) return null;
+  return {
+    title: `Port ${wanted} is in use by another program`,
+    body:
+      `The bot server runs at ${url} instead. Point the Chrome extension at the new address ` +
+      `(Find the desktop app in its options). If you do not know what uses port ${wanted}, do not sign in there.`,
+  };
+}
+
 module.exports = {
   DEFAULT_PORT,
+  portChangeNotice,
   sidecarExecutableName,
   splitCommandLine,
   findPython,

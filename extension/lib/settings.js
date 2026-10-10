@@ -1,5 +1,6 @@
 // User settings (chrome.storage.local "settings") with defaults and validation.
 
+import { tryNormalizePairingCode } from './pairing.js';
 import { DEFAULT_SERVER_URL, tryNormalizeServerUrl } from './server.js';
 
 export const SETTINGS_KEY = 'settings';
@@ -17,6 +18,7 @@ export const NOTIFY_KINDS = Object.freeze({
 export function defaultSettings() {
   return {
     serverUrl: DEFAULT_SERVER_URL,
+    pairingCode: '',     // the desktop app's pairing code (lib/pairing.js)
     pollMinutes: 1,
     notify: Object.fromEntries(Object.keys(NOTIFY_KINDS).map((k) => [k, true])),
   };
@@ -40,6 +42,7 @@ export function sanitizeSettings(stored) {
   }
   return {
     serverUrl: tryNormalizeServerUrl(s.serverUrl) || base.serverUrl,
+    pairingCode: tryNormalizePairingCode(s.pairingCode),
     pollMinutes: s.pollMinutes === undefined ? base.pollMinutes : clampPollMinutes(s.pollMinutes),
     notify,
   };

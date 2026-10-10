@@ -4,10 +4,17 @@ import { test } from 'node:test';
 import { createTokenStore } from '../lib/api.js';
 import { ALARM_NAME, ensureAlarm, lastSnapshot, MONITOR_KEY, runPoll } from '../lib/poller.js';
 import { saveSettings } from '../lib/settings.js';
-import { ADMIN, botStatus, fakeFetch, makeChrome, USER } from './fake-chrome.mjs';
+import { ADMIN, botStatus, fakeFetch, makeChrome, PAIRING_CODE, USER } from './fake-chrome.mjs';
 
 const BASE = 'http://127.0.0.1:47821';
 const now = () => Date.parse('2026-10-08T12:05:00Z');
+
+/** An extension paired with the desktop app (the pairing code is in its settings). */
+function pairedChrome(options) {
+  const chrome = makeChrome(options);
+  chrome.storage.local.data.settings = { pairingCode: PAIRING_CODE };
+  return chrome;
+}
 
 function server({ user = ADMIN, bot = () => botStatus(), up = () => true } = {}) {
   return fakeFetch((method, path) => {
@@ -24,7 +31,7 @@ async function signedIn(chrome, server_ = BASE) {
 }
 
 test('server down: DOWN badge, no notifications, nothing thrown', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   await signedIn(chrome);
   const r = await runPoll({ chromeApi: chrome, fetchImpl: server({ up: () => false }), now });
   assert.equal(r.snapshot.phase, 'disconnected');
@@ -36,7 +43,7 @@ test('server down: DOWN badge, no notifications, nothing thrown', async () => {
 });
 
 test('server answering with an error: disconnected, with the reason', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   const fetchImpl = fakeFetch(() => ({ status: 502, raw: '<html>Bad gateway</html>' }));
   const r = await runPoll({ chromeApi: chrome, fetchImpl, now });
   assert.equal(r.snapshot.phase, 'disconnected');
@@ -45,7 +52,7 @@ test('server answering with an error: disconnected, with the reason', async () =
 });
 
 test('not signed in: "?" badge and no authenticated calls', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   const fetchImpl = server();
   const r = await runPoll({ chromeApi: chrome, fetchImpl, now });
   assert.equal(r.snapshot.phase, 'signed_out');
@@ -54,7 +61,7 @@ test('not signed in: "?" badge and no authenticated calls', async () => {
 });
 
 test('non-admin: connectivity only, the bot status is never requested', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   await signedIn(chrome);
   const fetchImpl = server({ user: USER });
   const r = await runPoll({ chromeApi: chrome, fetchImpl, now });
@@ -64,7 +71,7 @@ test('non-admin: connectivity only, the bot status is never requested', async ()
 });
 
 test('admin who lost the role (403) is shown as a plain user', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   await signedIn(chrome);
   const fetchImpl = fakeFetch((m, p) => {
     if (p === '/health') return { body: {} };
@@ -76,7 +83,7 @@ test('admin who lost the role (403) is shown as a plain user', async () => {
 });
 
 test('remote server without the host permission: "!" and no request at all', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   await saveSettings({ serverUrl: 'https://bot.example.com' }, chrome);
   const fetchImpl = fakeFetch(() => ({ body: {} }), { base: 'https://bot.example.com' });
   const r = await runPoll({ chromeApi: chrome, fetchImpl, now });
@@ -86,7 +93,7 @@ test('remote server without the host permission: "!" and no request at all', asy
 });
 
 test('remote server with the permission is polled', async () => {
-  const chrome = makeChrome({ granted: ['https://bot.example.com/*'] });
+  const chrome = pairedChrome({ granted: ['https://bot.example.com/*'] });
   await saveSettings({ serverUrl: 'https://bot.example.com' }, chrome);
   const fetchImpl = fakeFetch((m, p) => (p === '/health' ? { body: {} } : undefined), { base: 'https://bot.example.com' });
   const r = await runPoll({ chromeApi: chrome, fetchImpl, now });
@@ -95,7 +102,7 @@ test('remote server with the permission is polled', async () => {
 });
 
 test('admin: badge follows the bot and notifications fire once per transition', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   await signedIn(chrome);
   let state = botStatus({ enabled: true });
   let up = true;
@@ -133,7 +140,7 @@ test('admin: badge follows the bot and notifications fire once per transition', 
 });
 
 test('alert memory is per server and account', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   await signedIn(chrome);
   const halted = botStatus({ halted: true });
   await runPoll({ chromeApi: chrome, fetchImpl: server({ bot: () => halted }), now });
@@ -144,7 +151,7 @@ test('alert memory is per server and account', async () => {
 });
 
 test('blocked notifications do not break the poll and are not retried every minute', async () => {
-  const chrome = makeChrome({ notificationsFail: true });
+  const chrome = pairedChrome({ notificationsFail: true });
   await signedIn(chrome);
   const fetchImpl = server({ bot: () => botStatus({ halted: true }) });
   const r1 = await runPoll({ chromeApi: chrome, fetchImpl, now });
@@ -155,7 +162,7 @@ test('blocked notifications do not break the poll and are not retried every minu
 });
 
 test('notification preferences are honoured', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   await signedIn(chrome);
   await saveSettings({ notify: { halted: false } }, chrome);
   await runPoll({ chromeApi: chrome, fetchImpl: server({ bot: () => botStatus({ halted: true }) }), now });
@@ -164,10 +171,25 @@ test('notification preferences are honoured', async () => {
 });
 
 test('ensureAlarm creates the alarm and follows the interval', async () => {
-  const chrome = makeChrome();
+  const chrome = pairedChrome();
   assert.equal(await ensureAlarm(chrome, 1), true);
   assert.deepEqual(chrome.alarmMap.get(ALARM_NAME), { name: ALARM_NAME, periodInMinutes: 1, delayInMinutes: 1 });
   assert.equal(await ensureAlarm(chrome, 1), false, 'unchanged: left alone');
   assert.equal(await ensureAlarm(chrome, 5), true);
   assert.equal(chrome.alarmMap.get(ALARM_NAME).periodInMinutes, 5);
+});
+
+test('a poll whose server changed meanwhile does not overwrite the new badge', async () => {
+  const chrome = pairedChrome();
+  const inner = server();
+  const before = chrome.badge.text;
+  const fetchImpl = async (url, init) => {
+    // The user points the extension at another server while this poll is in flight.
+    chrome.storage.local.data.settings = { ...chrome.storage.local.data.settings, serverUrl: 'http://127.0.0.1:47841' };
+    return inner(url, init);
+  };
+  const r = await runPoll({ chromeApi: chrome, fetchImpl, now });
+  assert.equal(r.stale, true);
+  assert.equal(chrome.badge.text, before, 'the stale result left the badge alone');
+  assert.equal(await lastSnapshot(chrome), null, 'and stored nothing');
 });

@@ -7,7 +7,7 @@ const path = require('node:path');
 const { DEFAULTS, PreferencesStore, parsePreferences, serializePreferences } = require('../lib/preferences');
 
 test('defaults: keep the computer awake, tray notice not shown yet', () => {
-  assert.deepEqual(DEFAULTS, { keepAwake: true, trayNoticeShown: false });
+  assert.deepEqual(DEFAULTS, { keepAwake: true, trayNoticeShown: false, lastVersion: '' });
   assert.deepEqual(parsePreferences(''), DEFAULTS);
   assert.deepEqual(parsePreferences('not json'), DEFAULTS);
   assert.deepEqual(parsePreferences('[1]'), DEFAULTS);
@@ -15,14 +15,19 @@ test('defaults: keep the computer awake, tray notice not shown yet', () => {
 });
 
 test('parsePreferences keeps valid values and drops unknown or mistyped ones', () => {
-  assert.deepEqual(parsePreferences('{"keepAwake": false, "trayNoticeShown": "yes", "evil": 1}'), {
+  assert.deepEqual(parsePreferences('{"keepAwake": false, "trayNoticeShown": "yes", "lastVersion": "1.0.0", "evil": 1}'), {
     keepAwake: false,
     trayNoticeShown: false,
+    lastVersion: '1.0.0',
   });
 });
 
 test('serializePreferences writes only known keys', () => {
-  assert.deepEqual(JSON.parse(serializePreferences({ keepAwake: false, other: 1 })), { keepAwake: false, trayNoticeShown: false });
+  assert.deepEqual(JSON.parse(serializePreferences({ keepAwake: false, other: 1 })), {
+    keepAwake: false,
+    trayNoticeShown: false,
+    lastVersion: '',
+  });
 });
 
 test('PreferencesStore round-trips through the file', () => {

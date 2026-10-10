@@ -87,7 +87,8 @@ export const DESKTOP_PORTS = Object.freeze(Array.from({ length: 21 }, (_, i) => 
 /**
  * Look for running desktop apps on this computer: every loopback port of the
  * desktop range whose /health answers like this backend. Resolves with their
- * base URLs, lowest port first ([] when none is running).
+ * base URLs, lowest port first ([] when none is running). Any program can answer
+ * like that: only the pairing check (lib/pairing.js) tells which one is the app.
  */
 export async function findDesktopServers({ fetchImpl, ports = DESKTOP_PORTS, timeoutMs = 2000 } = {}) {
   const doFetch = fetchImpl || globalThis.fetch.bind(globalThis);

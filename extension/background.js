@@ -3,25 +3,35 @@
 // All logic lives in lib/poller.js; this file only wires Chrome events to it.
 
 import { ApiClient, AUTH_KEY, createTokenStore } from './lib/api.js';
+import { ensurePaired } from './lib/pairing.js';
 import { ALARM_NAME, ensureAlarm, runPoll } from './lib/poller.js';
 import { dashboardUrl } from './lib/server.js';
 import { getSettings, SETTINGS_KEY } from './lib/settings.js';
 import { NOTIFICATION_PREFIX } from './lib/alerts.js';
 
 let inFlight = null;
+let rerun = false;
 
-/** One poll at a time: alarms, popup requests and setting changes share it. */
+/**
+ * One poll at a time: alarms, popup requests and setting changes share it.
+ * A request that arrives while a poll is running (e.g. the server URL was just
+ * changed) gets a fresh poll right after it, never the stale one's result.
+ */
 function poll() {
-  if (!inFlight) {
-    inFlight = runPoll()
-      .catch((e) => {
-        console.warn('Poll failed', e);
-        return null;
-      })
-      .finally(() => {
-        inFlight = null;
-      });
+  if (inFlight) {
+    rerun = true;
+    return inFlight.then(() => (inFlight ? inFlight : poll()));
   }
+  rerun = false;
+  inFlight = runPoll()
+    .catch((e) => {
+      console.warn('Poll failed', e);
+      return null;
+    })
+    .finally(() => {
+      inFlight = null;
+      if (rerun) poll();
+    });
   return inFlight;
 }
 
@@ -75,12 +85,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-// Clicking a notification opens the bot page of the web dashboard.
+// Clicking a notification opens the bot page of the web dashboard, if the server on
+// this computer still is the paired desktop app (the dashboard keeps its session in
+// that origin's storage); otherwise the settings, which say what is wrong.
 chrome.notifications.onClicked.addListener(async (id) => {
   if (!id.startsWith(NOTIFICATION_PREFIX)) return;
-  const { serverUrl } = await getSettings();
-  await chrome.tabs.create({ url: dashboardUrl(serverUrl, 'bot') });
   chrome.notifications.clear(id);
+  const { serverUrl, pairingCode } = await getSettings();
+  try {
+    await ensurePaired({ baseUrl: serverUrl, code: pairingCode });
+  } catch {
+    chrome.runtime.openOptionsPage().catch(() => {});
+    return;
+  }
+  await chrome.tabs.create({ url: dashboardUrl(serverUrl, 'bot') });
 });
 
 // A worker restarted by Chrome keeps no state: make sure the alarm exists.

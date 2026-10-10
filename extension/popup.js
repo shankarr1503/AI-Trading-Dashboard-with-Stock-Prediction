@@ -28,6 +28,7 @@ let panicTimer = null;
 function errorText(e) {
   if (!e) return 'Unknown error';
   if (e.kind === 'auth') return `${e.message}. Open settings to sign in.`;
+  if (e.kind === 'pairing') return e.message;
   return e.message || String(e);
 }
 
@@ -44,7 +45,15 @@ function openOptions() {
   chrome.runtime.openOptionsPage();
 }
 
-function openDashboard(page = 'bot') {
+async function openDashboard(page = 'bot') {
+  // The dashboard keeps its session in the server origin's storage: only open it on
+  // the paired desktop app (a check from the last minute is reused).
+  try {
+    await client.ensureTrusted();
+  } catch (e) {
+    message($('bot-msg'), errorText(e), 'error');
+    return;
+  }
   chrome.tabs.create({ url: dashboardUrl(settings.serverUrl, page) });
 }
 
@@ -72,6 +81,14 @@ function renderHeader(snap) {
       conn.dataset.state = 'warn';
       text.textContent = `${host} · no access`;
       break;
+    case 'unpaired':
+      conn.dataset.state = 'warn';
+      text.textContent = `${host} · not paired`;
+      break;
+    case 'untrusted':
+      conn.dataset.state = 'down';
+      text.textContent = `${host} · not your app`;
+      break;
     default:
       conn.dataset.state = 'down';
       text.textContent = `${host} · offline`;
@@ -95,6 +112,19 @@ function renderNotice(snap) {
       title = 'Access to the server not granted';
       body = `Chrome has not allowed this extension to reach ${settings.serverUrl}. Open settings and save the server again to grant access.`;
       retry = false;
+      break;
+    case 'unpaired':
+      title = 'Pair the extension with the desktop app';
+      body = `Before the extension sends your password or session to ${settings.serverUrl}, it checks that the server `
+        + 'is your AI Trading Bot app. Copy the pairing code from the app\'s tray menu (Copy Pairing Code for the '
+        + 'Chrome Extension) and paste it into the settings.';
+      optionsLabel = 'Open settings';
+      retry = false;
+      break;
+    case 'untrusted':
+      title = 'This server is not your AI Trading Bot app';
+      body = `${truncate(snap.error || `${settings.serverUrl} could not prove it is the paired desktop app.`, 320)}`;
+      optionsLabel = 'Open settings';
       break;
     case 'signed_out':
       title = 'Not signed in';
@@ -496,7 +526,7 @@ async function init() {
   $('version').textContent = chrome.runtime.getManifest().version;
   wire();
   settings = await getSettings();
-  client = new ApiClient({ baseUrl: settings.serverUrl });
+  client = new ApiClient({ baseUrl: settings.serverUrl, pairingCode: settings.pairingCode });
 
   // Instant first paint from what the service worker saw last, then a live refresh.
   const last = await lastSnapshot().catch(() => null);

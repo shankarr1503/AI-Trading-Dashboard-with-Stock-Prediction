@@ -10,12 +10,21 @@
  *
  * Sidecar contract: backend/desktop.py. Pure helpers (tested with node --test): lib/.
  *
- * TRADEBOT_SMOKE=1 runs a self-test: start the sidecar, load the dashboard, check the
- * window guards, print SMOKE_OK <url>, quit through the normal graceful path and exit
- * 0 only if the sidecar exited 0 (see scripts/smoke.mjs).
+ * First account: while none exists, the server only lets the app window create it
+ * (the shell adds its control token to that one request, see lib/pairing.js), so a
+ * web page or another program on the computer cannot claim the administrator account.
+ *
+ * --quit asks a running instance to quit the normal, graceful way without questions
+ * (the Windows installer does this before replacing the app, see build/installer.nsh).
+ *
+ * TRADEBOT_SMOKE=1 runs a self-test: start the sidecar, create the first account in the
+ * app window, load the dashboard, check the window guards, print SMOKE_OK <url>, quit
+ * through the normal graceful path and exit 0 only if the sidecar exited 0 (see
+ * scripts/smoke.mjs).
  */
 const {
   app,
+  BaseWindow,
   BrowserWindow,
   Menu,
   Notification,
@@ -38,16 +47,20 @@ const { autostartPath, desktopEntry } = require('./lib/autostart');
 const { requestJson } = require('./lib/backend-client');
 const { openLog } = require('./lib/logfile');
 const { classifyNavigation, isSafeExternalUrl, originOf } = require('./lib/navigation');
+const { addsDesktopToken, formatPairingCode, readPairingCode } = require('./lib/pairing');
 const { browserDataDir, defaultDataDir } = require('./lib/paths');
 const { PreferencesStore } = require('./lib/preferences');
 const { LineBuffer, parseProtocolLine } = require('./lib/protocol');
-const { buildSidecarEnv, resolveSidecar } = require('./lib/sidecar');
+const { shutdownWaitMs, stopDeadlineSeconds, stoppingDetail } = require('./lib/shutdown');
+const { buildSidecarEnv, portChangeNotice, resolveSidecar } = require('./lib/sidecar');
 const { describeExit, formatStatus, quitWarning } = require('./lib/status');
 
 const APP_NAME = 'AI Trading Bot';
 const APP_ID = 'com.aitradingbot.desktop';
 const READY_TIMEOUT_MS = 120_000; // first start: migrations, Python imports
-const SHUTDOWN_WAIT_MS = 160_000; // the sidecar lets a running bot cycle finish (≤150 s) + HTTP grace
+const DEFAULT_SHUTDOWN_WAIT_MS = shutdownWaitMs(null); // the sidecar's worst case (210 s) + margin: lib/shutdown.js
+const SHUTDOWN_REQUEST_ATTEMPTS = 3; // the control API is asked this often before falling back to a signal
+const SESSION_END_GRACE_MS = 15_000; // Windows session end: then stop without waiting for the cycle
 const KILL_WAIT_MS = 10_000;
 const CLOSE_GRACE_MS = 3_000; // after 'exit', how long to wait for the last stdout data
 const INFO_POLL_MS = 30_000;
@@ -89,8 +102,10 @@ let powerBlockerId = null;
 let infoTimer = null;
 let restarting = false;
 let quitPhase = 'none'; // none | confirming | stopping | done
-let systemShuttingDown = false;
-const smoke = { failed: false, external: [], page: null, info: null };
+let unattendedQuit = false; // system shutdown, session end or --quit: no questions
+let sessionWatcher = null; // Windows: hidden window that hears about session end
+let portNoticeShown = false;
+const smoke = { failed: false, external: [], page: null, info: null, account: null, quitVia: null };
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -294,6 +309,7 @@ function startBackend() {
   }
   child.expectedExit = false;
   child.readySeen = false;
+  child.requestedPort = env.TRADEBOT_PORT;
   child.exited = trackExit(child);
   Object.assign(state, { child, token, url: null, version: null, info: null, lastError: null, outputTail: [] });
   setPhase('starting');
@@ -329,6 +345,7 @@ function startBackend() {
         Object.assign(state, { url: message.info.url, version: message.info.version });
         log('info', `bot server ready at ${message.info.url} (version ${message.info.version}, data ${message.info.dataDir})`);
         setPhase('running');
+        notePortChange(child.requestedPort, message.info.url);
         startInfoPolling();
         resolve(message.info);
       } else if (message.type === 'error') {
@@ -378,9 +395,28 @@ function startBackend() {
   });
 }
 
+/** POST /api/desktop/shutdown. Resolves with the answer's body, or null when it was not accepted. */
+async function requestShutdown(child, { urgent = false } = {}) {
+  if (!child.readySeen || !state.url || !state.token || state.child !== child) return null;
+  try {
+    const res = await requestJson(`${state.url}/api/desktop/shutdown${urgent ? '?urgent=true' : ''}`, {
+      method: 'POST',
+      headers: { 'X-Desktop-Token': state.token },
+      timeoutMs: 15_000,
+    });
+    if (res.status === 202) return res.data && typeof res.data === 'object' ? res.data : {};
+    log('warn', `the shutdown request was answered with HTTP ${res.status}`);
+  } catch (err) {
+    log('warn', `the shutdown request failed: ${err.message}`);
+  }
+  return null;
+}
+
 /**
  * Graceful stop: POST /api/desktop/shutdown (the sidecar finishes a running bot
- * cycle, then exits 0), wait up to SHUTDOWN_WAIT_MS, then kill as a last resort.
+ * cycle, then exits 0), retried a few times: on Windows the fallback signal is an
+ * immediate TerminateProcess. Waits as long as the sidecar says its stop can take
+ * (deadline_seconds) plus a margin, then kills it as a last resort.
  */
 async function stopBackend(reason) {
   const child = state.child;
@@ -390,30 +426,38 @@ async function stopBackend(reason) {
   setPhase('stopping');
   log('info', `stopping the bot server (${reason})`);
 
-  let asked = false;
-  if (child.readySeen && state.url && state.token) {
-    try {
-      const res = await requestJson(`${state.url}/api/desktop/shutdown`, {
-        method: 'POST',
-        headers: { 'X-Desktop-Token': state.token },
-        timeoutMs: 15_000,
-      });
-      asked = res.status === 202;
-      if (!asked) log('warn', `the shutdown request was answered with HTTP ${res.status}`);
-    } catch (err) {
-      log('warn', `the shutdown request failed: ${err.message}`);
-    }
+  let answer = null;
+  for (let attempt = 1; attempt <= SHUTDOWN_REQUEST_ATTEMPTS && !answer && child.readySeen; attempt += 1) {
+    answer = await requestShutdown(child);
+    if (!answer && attempt < SHUTDOWN_REQUEST_ATTEMPTS && (await waitForExit(child, 2000))) break; // exited meanwhile
   }
-  if (!asked) signalChild(child, 'SIGTERM'); // POSIX: the sidecar stops gracefully on SIGTERM too
+  if (answer) log('info', `the bot server accepted the stop; it ends within ${stopDeadlineSeconds(answer)} s`);
+  else signalChild(child, 'SIGTERM'); // POSIX: the sidecar stops gracefully on SIGTERM too
 
-  let result = await waitForExit(child, SHUTDOWN_WAIT_MS);
+  const waitMs = shutdownWaitMs(answer);
+  let result = await waitForExit(child, waitMs);
   if (!result) {
-    log('error', `the bot server did not stop within ${SHUTDOWN_WAIT_MS / 1000} s; killing it`);
+    log('error', `the bot server did not stop within ${Math.round(waitMs / 1000)} s; killing it`);
     signalChild(child, 'SIGKILL');
     result = (await waitForExit(child, KILL_WAIT_MS)) || { code: null, signal: 'SIGKILL' };
   }
-  log('info', `the bot server stopped (${describeExit(result.code, result.signal)})`);
+  log(result.code === 0 ? 'info' : 'warn', `the bot server stopped (${describeExit(result.code, result.signal)})`);
   return result;
+}
+
+/**
+ * The operating system is ending the session and will not wait for a trading cycle:
+ * ask the sidecar to stop now (it cancels a running cycle at its next step), on top
+ * of a graceful stop that may already be waiting.
+ */
+function urgentStop(why) {
+  const child = state.child;
+  if (!child || child.urgentStopSent) return;
+  child.urgentStopSent = true;
+  log('warn', `${why}: asking the bot server to stop without waiting for the trading cycle`);
+  requestShutdown(child, { urgent: true }).then((answer) => {
+    if (!answer) signalChild(child, 'SIGTERM');
+  });
 }
 
 /** Last resort when the app exits without the graceful path (the sidecar also watches us). */
@@ -451,6 +495,16 @@ function startInfoPolling() {
 function stopInfoPolling() {
   if (infoTimer) clearInterval(infoTimer);
   infoTimer = null;
+}
+
+/** The sidecar had to move to another port: say so instead of changing addresses silently. */
+function notePortChange(requestedPort, url) {
+  const notice = portChangeNotice(requestedPort, url);
+  if (!notice) return;
+  log('warn', `${notice.title}: ${notice.body}`);
+  if (portNoticeShown) return; // once per launch (restarts usually land on the same port again)
+  portNoticeShown = true;
+  notify(notice.title, notice.body);
 }
 
 // ─── Start / restart / failures ───────────────────────────────────────────────
@@ -597,6 +651,22 @@ function configureSession(ses) {
     callback(ok);
   });
   ses.setPermissionCheckHandler((_contents, permission, requestingOrigin) => allowed(permission, requestingOrigin));
+
+  // While no account exists, the server lets only the app window create the first
+  // (administrator) account: the shell adds this launch's control token to the
+  // window's own POST /auth/register, and to nothing else. The page cannot read it.
+  ses.webRequest.onBeforeSendHeaders({ urls: ['http://127.0.0.1/*'] }, (details, callback) => {
+    const headers = { ...details.requestHeaders };
+    for (const name of Object.keys(headers)) {
+      if (name.toLowerCase() === 'x-desktop-token') delete headers[name]; // never one the page made up
+    }
+    const fromAppWindow = isOpen(mainWindow) && details.webContentsId === mainWindow.webContents.id;
+    if (state.token && addsDesktopToken({ url: details.url, method: details.method, appUrl: state.url, fromAppWindow })) {
+      headers['X-Desktop-Token'] = state.token;
+      log('info', 'added the app window token to its account registration request');
+    }
+    callback({ requestHeaders: headers });
+  });
 }
 
 function createMainWindow() {
@@ -725,6 +795,7 @@ function controlItems() {
       enabled: running,
       click: copyServerUrl,
     },
+    { label: 'Copy Pairing Code for the Chrome Extension', enabled: !!dataDir, click: copyPairingCode },
     { type: 'separator' },
     { label: 'Open Data Folder', click: () => openDataFolder() },
     { label: 'Edit Settings…', click: () => editSettings() },
@@ -808,6 +879,27 @@ function copyServerUrl() {
   if (!state.url) return;
   clipboard.writeText(state.url);
   notify('Server URL copied', `${state.url} — paste it into the Chrome extension's options to connect it to this app.`);
+}
+
+function copyPairingCode() {
+  const code = readPairingCode(dataDir);
+  if (!code) {
+    dialog
+      .showMessageBox({
+        type: 'info',
+        title: APP_NAME,
+        message: 'There is no pairing code yet.',
+        detail: 'It is created the first time the bot server starts. Start it, then try again.',
+      })
+      .catch(() => {});
+    return;
+  }
+  clipboard.writeText(formatPairingCode(code));
+  notify(
+    'Pairing code copied',
+    "Paste it into the Chrome extension's options (Pairing code). The extension then checks that it talks to " +
+      'this app before it sends your password. Keep the code private.',
+  );
 }
 
 async function openPathOrReport(target) {
@@ -956,7 +1048,7 @@ async function beginQuit() {
   if (quitPhase !== 'none') return; // the confirmation is already showing
   quitPhase = 'confirming';
 
-  if (state.child && state.phase === 'running' && !systemShuttingDown) {
+  if (state.child && state.phase === 'running' && !unattendedQuit) {
     const info = await fetchInfo(); // what is at stake, straight from the server
     const warning = quitWarning(info);
     if (warning && !SMOKE) {
@@ -985,11 +1077,7 @@ async function beginQuit() {
   if (isOpen(mainWindow)) mainWindow.destroy(); // the dashboard does not need to watch the shutdown
   let result = { code: 0, signal: null };
   if (state.child) {
-    showStatus(
-      'Stopping safely…',
-      'Waiting for the trading bot to finish its current cycle and save its state. This can take up to 2½ minutes.',
-      { closable: false },
-    );
+    showStatus('Stopping safely…', stoppingDetail(), { closable: false });
     result = await stopBackend('quit');
   }
   finishQuit(result);
@@ -1029,7 +1117,7 @@ function smokeFail(reason) {
     return;
   }
   quitPhase = 'stopping';
-  setTimeout(() => app.exit(1), SHUTDOWN_WAIT_MS + KILL_WAIT_MS + 5_000);
+  setTimeout(() => app.exit(1), DEFAULT_SHUTDOWN_WAIT_MS + KILL_WAIT_MS + 5_000);
   stopBackend('self-test failed')
     .catch(() => {})
     .finally(() => app.exit(1));
@@ -1043,6 +1131,8 @@ function completeSmoke(result) {
     url: state.url,
     page: smoke.page,
     info: smoke.info,
+    account: smoke.account,
+    quitVia: smoke.quitVia,
     backendExit: { code: result.code, signal: result.signal },
   });
   say(ok ? 'SMOKE_DONE the bot server stopped cleanly (exit code 0)' : `SMOKE_FAIL the bot server ${describeExit(result.code, result.signal)}`);
@@ -1083,9 +1173,109 @@ async function waitForDashboard(timeoutMs) {
   throw new Error(`the dashboard did not load within ${timeoutMs / 1000} s (last state: ${JSON.stringify(last)})`);
 }
 
+async function waitInWindow(code, timeoutMs, what) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    try {
+      last = isOpen(mainWindow) ? await evalIn(mainWindow.webContents, code) : null;
+      if (last) return last;
+    } catch {
+      /* navigating: try again */
+    }
+    await delay(250);
+  }
+  throw new Error(`${what} did not happen within ${timeoutMs / 1000} s (last: ${JSON.stringify(last)})`);
+}
+
+/**
+ * First run: the first account can only be created in the app window. A request from
+ * anywhere else (here the shell's own HTTP client, like any other program) is refused;
+ * the dashboard's real sign-up form in the window creates the administrator account.
+ */
+async function smokeFirstAccount() {
+  const account = { email: 'owner@example.com', username: 'owner', password: 'smoke-Password-123' };
+  const outside = await requestJson(`${state.url}/auth/register`, {
+    method: 'POST',
+    body: { ...account, email: 'intruder@example.com', username: 'intruder' },
+    timeoutMs: 15_000,
+  });
+  const outsideDetail = outside.data && outside.data.detail;
+  if (outside.status !== 403 || !/app window/.test(String(outsideDetail))) {
+    throw new Error(`a registration from outside the app window was not refused: HTTP ${outside.status} ${JSON.stringify(outside.data)}`);
+  }
+
+  await mainWindow.loadURL(`${state.url}/login/`).catch(() => {});
+  await waitInWindow(
+    `(() => { const b = Array.from(document.querySelectorAll('button')).find((x) => x.textContent.trim() === 'Create an account');
+              if (!b) return false; b.click(); return true; })()`,
+    30_000,
+    'the sign-up form',
+  );
+  await waitInWindow(`!!document.querySelector('input[pattern]')`, 10_000, 'the username field');
+  await evalIn(
+    mainWindow.webContents,
+    `(() => {
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      const fill = (el, value) => { set.call(el, value); el.dispatchEvent(new Event('input', { bubbles: true })); };
+      fill(document.querySelector('input[type=email]'), ${JSON.stringify(account.email)});
+      fill(document.querySelector('input[pattern]'), ${JSON.stringify(account.username)});
+      fill(document.querySelector('input[type=password]'), ${JSON.stringify(account.password)});
+      setTimeout(() => document.querySelector('button[type=submit]').click(), 50);
+      return true;
+    })()`,
+  );
+  await waitInWindow(
+    `location.pathname.startsWith('/dashboard') && !!localStorage.getItem('access_token')`,
+    30_000,
+    'signing up in the app window',
+  );
+  // Checked from here, not from the page: the dashboard is busy loading market data
+  // then, and Chromium allows only six connections per server.
+  const token = await evalIn(mainWindow.webContents, `localStorage.getItem('access_token')`);
+  const me = await requestJson(`${state.url}/auth/me`, { headers: { Authorization: `Bearer ${token}` }, timeoutMs: 15_000 });
+  const again = await requestJson(`${state.url}/auth/register`, {
+    method: 'POST',
+    body: { email: 'second@example.com', username: 'second', password: 'second-Password-123' },
+    timeoutMs: 15_000,
+  });
+  const check = { me: me.status === 200 ? me.data : me.status, again: again.status, againDetail: again.data && again.data.detail };
+  if (!check.me || check.me.email !== account.email || check.me.is_superuser !== true) {
+    throw new Error(`the account created in the app window is not the administrator: ${JSON.stringify(check)}`);
+  }
+  if (check.again !== 403 || check.againDetail !== 'Registration is closed') {
+    throw new Error(`registration did not close after the first account: ${JSON.stringify(check)}`);
+  }
+  return { email: account.email, admin: true, outsideRefused: outsideDetail, secondRegistration: check.againDetail };
+}
+
+/**
+ * Quit the way the Windows installer does: start the app again with --quit, which
+ * makes this instance quit gracefully (second-instance). Falls back to app.quit()
+ * when the self-test runs without a fixed profile folder (a second instance would
+ * not find this one).
+ */
+function smokeQuit() {
+  if (!process.env.TRADEBOT_SMOKE_USER_DATA) {
+    smoke.quitVia = 'app.quit';
+    app.quit();
+    return;
+  }
+  smoke.quitVia = '--quit';
+  const args = [...process.argv.slice(1).filter((arg) => arg !== '--quit'), '--quit'];
+  const other = spawn(process.execPath, args, { env: process.env, stdio: 'ignore' });
+  other.once('error', (err) => smokeFail(`could not start a second instance with --quit: ${err.message}`));
+  setTimeout(() => {
+    if (quitPhase === 'none') smokeFail('a second instance started with --quit did not make the app quit');
+  }, 30_000);
+}
+
 async function runSmoke() {
   smoke.page = await waitForDashboard(90_000);
   say(`SMOKE_PAGE ${JSON.stringify(smoke.page)}`);
+  smoke.account = await smokeFirstAccount();
+  say(`SMOKE_ACCOUNT ${JSON.stringify(smoke.account)}`);
+  smoke.page = await waitForDashboard(60_000);
   const contents = mainWindow.webContents;
 
   // Pop-ups are denied and external links go to the system browser instead.
@@ -1116,24 +1306,76 @@ async function runSmoke() {
   smoke.info = info;
   say(`SMOKE_INFO ${JSON.stringify(info)}`);
   say(`SMOKE_OK ${state.url}`);
-  app.quit(); // the real quit path: GET info, POST shutdown, wait for the sidecar to exit
+  smokeQuit(); // the real quit path: GET info, POST shutdown, wait for the sidecar to exit
 }
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
+
+/** Quit the graceful way, without questions (system shutdown, session end, --quit). */
+function quitUnattended(reason) {
+  log('info', `quitting: ${reason}`);
+  unattendedQuit = true;
+  if (quitPhase === 'none') app.quit();
+}
+
+/**
+ * Windows: shutdown, restart, log off, or an installer closing the app (Restart
+ * Manager). Windows only tells top-level windows and the app may only have its tray
+ * icon, so a hidden window without web contents listens. While Windows still asks
+ * (query-session-end), the app delays the end of the session for the graceful stop
+ * and, after SESSION_END_GRACE_MS, stops without waiting for a running cycle; once
+ * the session ends regardless (session-end), right away.
+ */
+function watchWindowsSessionEnd() {
+  if (!IS_WIN) return;
+  try {
+    sessionWatcher = new BaseWindow({ show: false, width: 1, height: 1, skipTaskbar: true, focusable: false, title: APP_NAME });
+  } catch (err) {
+    log('warn', `cannot watch for the end of the Windows session: ${err.message}`);
+    return;
+  }
+  const onEnding = (event, canDelay) => {
+    const reasons = (event && Array.isArray(event.reasons) && event.reasons.join(', ')) || 'unknown reason';
+    if (state.child) {
+      if (canDelay) event.preventDefault(); // Windows waits, showing that this app is still closing
+      setTimeout(() => urgentStop('Windows is ending the session'), canDelay ? SESSION_END_GRACE_MS : 0);
+    }
+    quitUnattended(`the Windows session is ending (${reasons})`);
+  };
+  sessionWatcher.on('query-session-end', (event) => onEnding(event, true));
+  sessionWatcher.on('session-end', (event) => onEnding(event, false));
+}
+
+/**
+ * The dashboard's HTML keeps its URL across versions. The server now marks it
+ * no-cache, but a version that did not may have left it in the disk cache with
+ * heuristic freshness: after an upgrade, start from an empty cache.
+ */
+async function clearCacheAfterUpgrade() {
+  const version = app.getVersion();
+  const previous = prefs.get('lastVersion');
+  if (previous === version) return;
+  try {
+    await session.defaultSession.clearCache();
+    log('info', `version ${previous || '(first start)'} → ${version}: cleared the browser cache`);
+  } catch (err) {
+    log('warn', `could not clear the browser cache: ${err.message}`);
+  }
+  prefs.set('lastVersion', version);
+}
 
 async function onReady() {
   configureSession(session.defaultSession);
   powerMonitor.on('shutdown', (event) => {
     // System shutdown / restart (Linux, macOS): stop gracefully, without questions.
-    systemShuttingDown = true;
-    if (quitPhase === 'none') {
-      event.preventDefault();
-      app.quit();
-    }
+    if (quitPhase === 'none') event.preventDefault();
+    quitUnattended('the system is shutting down');
   });
+  watchWindowsSessionEnd();
   createTray();
   rebuildMenus();
   if (SMOKE) setTimeout(() => smokeFail(`timed out after ${SMOKE_TIMEOUT_MS / 1000} s`), SMOKE_TIMEOUT_MS);
+  await clearCacheAfterUpgrade();
 
   const hidden = !SMOKE && launchedHidden();
   const started = await bootBackend({ showWindow: !hidden });
@@ -1156,7 +1398,11 @@ function main() {
       `packaged: ${app.isPackaged}, data: ${dataDir}${SMOKE ? ', self-test' : ''})`,
   );
 
-  app.on('second-instance', () => showDashboard());
+  // Starting the app again shows the window; `--quit` (the Windows installer) quits it gracefully.
+  app.on('second-instance', (_event, argv) => {
+    if (Array.isArray(argv) && argv.includes('--quit')) quitUnattended('asked to quit by another process (--quit)');
+    else showDashboard();
+  });
   app.on('activate', () => showDashboard()); // macOS: Dock icon clicked
   app.on('window-all-closed', () => {
     /* keep running in the tray: quitting is explicit */
@@ -1188,7 +1434,9 @@ app.setPath('crashDumps', path.join(browserDataDir(app.getPath('userData')), 'Cr
 if (!app.commandLine.hasSwitch('no-sandbox')) app.enableSandbox();
 
 if (!app.requestSingleInstanceLock()) {
-  app.quit(); // the running instance shows its window (second-instance)
+  app.quit(); // the running instance shows its window, or quits for --quit (second-instance)
+} else if (process.argv.includes('--quit')) {
+  app.quit(); // nothing running to quit
 } else {
   main();
 }

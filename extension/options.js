@@ -1,9 +1,12 @@
-// Options page: server URL (+ the host permission it needs), sign-in, polling
-// interval and notification preferences.
+// Options page: server URL (+ the host permission it needs), the desktop app's
+// pairing code, sign-in, polling interval and notification preferences.
 
 import { ApiClient, createTokenStore } from './lib/api.js';
 import { $, fill, h, message, show } from './lib/dom.js';
 import { relativeTime } from './lib/format.js';
+import {
+  forgetPairings, normalizePairingCode, pairingRequired, tryNormalizePairingCode, verifyServer,
+} from './lib/pairing.js';
 import { MONITOR_KEY } from './lib/poller.js';
 import {
   DEFAULT_SERVER_URL, DESKTOP_PORTS, findDesktopServers, hasServerPermission, normalizeServerUrl, permissionPatternFor,
@@ -20,6 +23,29 @@ const tokens = createTokenStore();
 
 function errorText(e) {
   return (e && e.message) || String(e);
+}
+
+function makeClient(url) {
+  return new ApiClient({ baseUrl: url, tokens, pairingCode: settings.pairingCode });
+}
+
+function formatCode(code) {
+  return code ? code.match(/.{1,4}/g).join('-') : '';
+}
+
+/** The code typed in the field when it is valid, else the saved one. */
+function currentCode() {
+  return tryNormalizePairingCode($('pairing-code').value) || settings.pairingCode;
+}
+
+/**
+ * Check that `url` is the paired desktop app, when that is needed. Resolves with a
+ * sentence for the message line, or null when no check applies; throws an ApiError.
+ */
+async function pairingCheck(url) {
+  if (!pairingRequired(url, settings.pairingCode)) return null;
+  await makeClient(url).ensureTrusted({ force: true });
+  return 'Paired: it proved it is your AI Trading Bot app.';
 }
 
 function hostOf(url) {
@@ -46,12 +72,20 @@ async function requestAccess(url) {
 
 async function testConnection(url, msgEl) {
   message(msgEl, `Connecting to ${url}…`, 'busy');
-  const probe = new ApiClient({ baseUrl: url, tokens });
+  const probe = makeClient(url);
   try {
     const health = await probe.health();
     const name = health && health.service ? health.service : 'server';
     const version = health && health.version ? ` ${health.version}` : '';
-    message(msgEl, `Connected: ${name}${version} is ${health && health.status ? health.status : 'up'}.`, 'ok');
+    const connected = `Connected: ${name}${version} is ${health && health.status ? health.status : 'up'}.`;
+    let paired;
+    try {
+      paired = await pairingCheck(url);
+    } catch (e) {
+      message(msgEl, `${connected} ${errorText(e)}`, 'error');
+      return false;
+    }
+    message(msgEl, paired ? `${connected} ${paired}` : connected, 'ok');
     return true;
   } catch (e) {
     let hint = '';
@@ -91,7 +125,7 @@ async function onSaveServer(ev) {
     }
   }
   settings = await saveSettings({ serverUrl: url });
-  client = new ApiClient({ baseUrl: url, tokens });
+  client = makeClient(url);
   $('server-url').value = url;
   const ok = await testConnection(url, msg);
   message(msg, ok ? `Saved. ${msg.textContent}` : `Saved, but: ${msg.textContent}`, ok ? 'ok' : 'error');
@@ -114,6 +148,12 @@ async function onTestServer() {
   await testConnection(url, msg);
 }
 
+/**
+ * "Find the desktop app": every server answering on the app's ports. Any program can
+ * answer there, so with a pairing code only a server that proves it is the paired
+ * app is picked; without one, only a single answer is filled in (and sign-in still
+ * waits for the pairing code).
+ */
 async function onFindServer() {
   const msg = $('server-msg');
   const button = $('server-find');
@@ -129,16 +169,74 @@ async function onFindServer() {
         + 'Start it, then try again.', 'error');
       return;
     }
-    $('server-url').value = found[0];
-    const others = found.length > 1 ? ` (also running: ${found.slice(1).join(', ')})` : '';
-    if (found[0] === settings.serverUrl) {
-      message(msg, `The desktop app is running at ${found[0]}, the server already in use${others}.`, 'ok');
+    const code = currentCode();
+    let pick;
+    let note = '';
+    if (code) {
+      const results = await Promise.all(found.map((url) => verifyServer({ baseUrl: url, code }).then(() => true, () => false)));
+      const mine = found.filter((_, i) => results[i]);
+      const others = found.filter((_, i) => !results[i]);
+      if (!mine.length) {
+        message(msg, `Found ${found.join(', ')}, but none of them proved it is your app with this pairing code. `
+          + 'Check the code (tray menu → Copy Pairing Code for the Chrome Extension).', 'error');
+        return;
+      }
+      [pick] = mine;
+      note = ' (pairing code checked)';
+      if (others.length) note += `. Also answering, but NOT your app: ${others.join(', ')}`;
+    } else if (found.length === 1) {
+      [pick] = found;
+      note = '. Enter its pairing code below before you sign in';
     } else {
-      message(msg, `Found the desktop app at ${found[0]}${others}. Press Save to use it.`, 'ok');
+      message(msg, `Several servers answer on this computer (${found.join(', ')}). Enter the pairing code below, `
+        + 'then press Find again to pick your app.', 'error');
+      return;
+    }
+    $('server-url').value = pick;
+    if (pick === settings.serverUrl) {
+      message(msg, `The desktop app is running at ${pick}, the server already in use${note}.`, 'ok');
+    } else {
+      message(msg, `Found the desktop app at ${pick}${note}. Press Save to use it.`, 'ok');
       $('server-save').focus();
     }
   } finally {
     button.disabled = false;
+  }
+}
+
+// ─── Pairing ────────────────────────────────────────────────────────────────
+
+async function onSavePairing(ev) {
+  ev.preventDefault();
+  const msg = $('pairing-msg');
+  const typed = $('pairing-code').value.trim();
+  let code = '';
+  if (typed) {
+    try {
+      code = normalizePairingCode(typed);
+    } catch (e) {
+      message(msg, errorText(e), 'error');
+      return;
+    }
+  }
+  settings = await saveSettings({ pairingCode: code });
+  forgetPairings();
+  client = makeClient(settings.serverUrl);
+  $('pairing-code').value = formatCode(code);
+  if (!code) {
+    message(msg, 'Pairing code removed.', 'ok');
+    return;
+  }
+  if (!pairingRequired(settings.serverUrl, code)) {
+    message(msg, 'Saved. It is checked for servers on this computer; the current server is checked by its certificate.', 'ok');
+    return;
+  }
+  message(msg, `Saved. Checking ${settings.serverUrl}…`, 'busy');
+  try {
+    await client.ensureTrusted({ force: true });
+    message(msg, `Saved. Paired: ${settings.serverUrl} proved it is your AI Trading Bot app.`, 'ok');
+  } catch (e) {
+    message(msg, `Saved, but: ${errorText(e)}`, 'error');
   }
 }
 
@@ -171,6 +269,8 @@ async function renderAccount() {
     if (e.kind === 'auth') {
       showSignedOut();
       message($('account-msg'), 'Your session has ended: sign in again.', 'error');
+    } else if (e.kind === 'pairing') {
+      message($('account-msg'), `Your session is not used: ${errorText(e)}`, 'error');
     }
   });
 }
@@ -206,7 +306,8 @@ async function onSignIn(ev) {
   } catch (e) {
     const text = e.kind === 'http' && e.status === 401 ? 'Wrong email or password.'
       : e.kind === 'http' && e.status === 422 ? 'Enter a valid email address.'
-        : errorText(e);
+        : e.kind === 'pairing' ? `Not signed in: ${errorText(e)}`
+          : errorText(e);
     message(msg, text, 'error');
   } finally {
     $('sign-in').disabled = false;
@@ -275,13 +376,15 @@ function renderStatusLine(record) {
 
 async function init() {
   settings = await getSettings();
-  client = new ApiClient({ baseUrl: settings.serverUrl, tokens });
+  client = makeClient(settings.serverUrl);
   $('server-url').value = settings.serverUrl;
+  $('pairing-code').value = formatCode(settings.pairingCode);
   renderMonitoring();
 
   $('server-form').addEventListener('submit', onSaveServer);
   $('server-test').addEventListener('click', onTestServer);
   $('server-find').addEventListener('click', onFindServer);
+  $('pairing-form').addEventListener('submit', onSavePairing);
   $('login-form').addEventListener('submit', onSignIn);
   $('sign-out').addEventListener('click', onSignOut);
   $('poll').addEventListener('change', onPollChange);

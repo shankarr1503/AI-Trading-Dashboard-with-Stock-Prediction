@@ -46,10 +46,15 @@ function quitWarning(info) {
   };
 }
 
+// backend/desktop.py EXIT_CUT_OFF: stopped, but a trading cycle or bot operation
+// overran the stop limit and had to be cancelled.
+const EXIT_CUT_OFF = 3;
+
 function describeExit(code, signal) {
   if (signal) return `stopped by signal ${signal}`;
   if (code === null || code === undefined) return 'exited';
+  if (code === EXIT_CUT_OFF) return `exit code ${code}: unfinished trading work had to be cancelled`;
   return `exit code ${code}`;
 }
 
-module.exports = { formatStatus, quitWarning, modeLabel, describeExit };
+module.exports = { EXIT_CUT_OFF, formatStatus, quitWarning, modeLabel, describeExit };

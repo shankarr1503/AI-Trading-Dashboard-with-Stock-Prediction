@@ -23,9 +23,18 @@ It needs Chrome 116 or later. Other Chromium browsers (Edge, Brave) work the sam
 
 ### Desktop app
 
-The desktop app serves everything on `http://127.0.0.1:47821`. If that port is busy, it takes the next free one up to 47841. The app's tray menu shows the exact URL. You can also press **Find the desktop app** in the extension settings: it asks each of those ports for `/health` on this computer and fills in the one that answers. Then press **Save**.
+The desktop app serves everything on `http://127.0.0.1:47821`. If that port is busy, it takes the next free one up to 47841 (and tells you so). The app's tray menu shows the exact URL.
 
-Sign in with the account you created in the desktop app. Its first account is the administrator.
+**Pair the extension with the app first.** Any program on the computer, including one run by another user, can listen on those ports and pose as the app. So the extension sends no password and no session token to a server on this computer until that server has proved it knows the app's pairing code:
+
+1. In the app's tray menu, choose **Copy Pairing Code for the Chrome Extension**.
+2. Paste it into **Pairing code** in the extension settings and press **Save code**.
+
+The extension then sends a random challenge to `GET /api/desktop/pair` and checks the answer (an HMAC-SHA256 of the challenge and the server's own address, keyed with the code) before every sign-in, and before authenticated requests at least once a minute. A server that fails the check gets nothing; the badge shows `!!` and the popup says the server is not your app. The check is always needed for the app's ports (47821 to 47841), and for every server on this computer once a code is entered (the app can be moved with `TRADEBOT_PORT`). Use `http://127.0.0.1:<port>`, not `localhost`: the app proves its own address.
+
+**Find the desktop app** in the settings asks each of those ports for `/health` and, with a pairing code entered, only picks the server that passes the check. Then press **Save**.
+
+Sign in with the account you created in the desktop app's window. Its first account is the administrator, and only the app window can create it.
 
 ### Self-hosted server
 
@@ -50,6 +59,8 @@ Bot status, alerts and controls need an **administrator** account: the bot's boo
 | `LATE` | No recent cycle while the bot has work to do (enabled, positions open or flatten pending) |
 | `DOWN` | Server not reachable (is the desktop app running?) |
 | `?`    | Not signed in |
+| `PAIR` | Desktop app not paired yet: enter the pairing code in the settings |
+| `!!`   | The server on this computer could not prove it is your desktop app: nothing is sent to it |
 | `!`    | Chrome has not granted access to the configured https server |
 | none   | Signed in without administrator rights |
 

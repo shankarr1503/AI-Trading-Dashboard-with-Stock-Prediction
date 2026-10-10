@@ -83,8 +83,14 @@ class Settings(BaseSettings):
     # Static frontend export (frontend/out) served at "/" in desktop mode.
     TRADEBOT_STATIC_DIR: str = ""
     # Random per launch (set by the Electron shell). Enables /api/desktop/* when
-    # set; requests must carry it in the X-Desktop-Token header.
+    # set; requests must carry it in the X-Desktop-Token header. While no account
+    # exists, /auth/register also requires it (the shell adds it to the app window's
+    # own registration request), so only the app's owner can create the first account.
     TRADEBOT_CONTROL_TOKEN: str = ""
+    # Per-install pairing code (<data dir>/pairing.key, set by the sidecar launcher).
+    # Enables /api/desktop/pair, which lets the Chrome extension check it talks to
+    # this app before it sends any credentials.
+    TRADEBOT_PAIRING_SECRET: str = ""
 
     # ─── CORS ────────────────────────────────────────────────────────────────
     # Comma-separated list. Kept as a plain string because pydantic-settings

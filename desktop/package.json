@@ -71,6 +71,7 @@
       "createStartMenuShortcut": true,
       "shortcutName": "AI Trading Bot",
       "deleteAppDataOnUninstall": false,
+      "include": "build/installer.nsh",
       "artifactName": "AI-Trading-Bot-Setup-${version}-${arch}.${ext}"
     },
     "mac": {

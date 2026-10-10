@@ -10,6 +10,7 @@ const path = require('node:path');
 const DEFAULTS = Object.freeze({
   keepAwake: true, // powerSaveBlocker 'prevent-app-suspension' while the bot server runs
   trayNoticeShown: false, // the one-time "still running in the tray" notification
+  lastVersion: '', // app version of the last start: the browser cache is cleared when it changes
 });
 
 /** Parses the stored JSON; unknown keys and wrongly typed values fall back to the defaults. */

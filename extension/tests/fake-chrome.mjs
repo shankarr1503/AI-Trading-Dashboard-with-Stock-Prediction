@@ -1,5 +1,10 @@
 // In-memory stand-ins for the chrome.* APIs and fetch used by lib/*.
 
+import { pairingProof } from '../lib/pairing.js';
+
+/** The desktop app's pairing code in these tests (fakeFetch answers the pairing check with it). */
+export const PAIRING_CODE = 'ABCDEFGHIJKLMNOPQRST';
+
 function clone(v) {
   return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
 }
@@ -94,15 +99,25 @@ export function makeChrome({ granted = [], notificationsFail = false } = {}) {
 
 /**
  * A scripted fetch: routes is a function (method, path, request) → {status, body} | Error.
- * Records every call in .calls ({method, path, auth, body}).
+ * Records every call in .calls ({method, path, auth, body}). Like the desktop app, it
+ * answers the pairing check (GET /api/desktop/pair) for `pairing` (a code; null: the
+ * routes answer it like any other path); those calls are recorded in .pairCalls only.
  */
-export function fakeFetch(routes, { base = 'http://127.0.0.1:47821' } = {}) {
+export function fakeFetch(routes, { base = 'http://127.0.0.1:47821', pairing = PAIRING_CODE } = {}) {
   const calls = [];
+  const pairCalls = [];
   const impl = async (url, init = {}) => {
     const u = new URL(url);
     const base0 = new URL(base);
     if (u.origin !== base0.origin) throw new TypeError(`unexpected origin ${u.origin}`);
     const path = u.pathname.slice(base0.pathname.replace(/\/$/, '').length) + u.search;
+    if (pairing && u.pathname === '/api/desktop/pair') {
+      pairCalls.push({ path, auth: (init.headers && init.headers.Authorization) || null, body: init.body });
+      const server = base.replace(/\/+$/, '');
+      const proof = await pairingProof(pairing, server, u.searchParams.get('nonce'));
+      const text = JSON.stringify({ v: 1, server, proof });
+      return { ok: true, status: 200, async text() { return text; } };
+    }
     const auth = (init.headers && init.headers.Authorization) || null;
     const body = init.body ? JSON.parse(init.body) : undefined;
     const call = { method: init.method || 'GET', path, auth, body };
@@ -119,6 +134,7 @@ export function fakeFetch(routes, { base = 'http://127.0.0.1:47821' } = {}) {
     };
   };
   impl.calls = calls;
+  impl.pairCalls = pairCalls;
   return impl;
 }
 

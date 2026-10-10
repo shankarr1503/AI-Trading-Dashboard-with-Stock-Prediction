@@ -1,7 +1,9 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildSidecarEnv, findPython, resolveSidecar, sidecarExecutableName, splitCommandLine } = require('../lib/sidecar');
+const {
+  buildSidecarEnv, findPython, portChangeNotice, resolveSidecar, sidecarExecutableName, splitCommandLine,
+} = require('../lib/sidecar');
 
 const TOKEN = 'a'.repeat(64);
 
@@ -109,4 +111,15 @@ test('buildSidecarEnv passes TRADEBOT_PORT through (the sidecar validates it)', 
 test('buildSidecarEnv requires a data dir and a strong token', () => {
   assert.throws(() => buildSidecarEnv({}, { token: TOKEN }), /dataDir/);
   assert.throws(() => buildSidecarEnv({}, { dataDir: '/d', token: 'short' }), /token/);
+});
+
+test('portChangeNotice: the sidecar moved to another port because something holds the usual one', () => {
+  const notice = portChangeNotice('47821', 'http://127.0.0.1:47822');
+  assert.equal(notice.title, 'Port 47821 is in use by another program');
+  assert.match(notice.body, /runs at http:\/\/127\.0\.0\.1:47822 instead/);
+  assert.match(notice.body, /Find the desktop app/);
+  assert.equal(portChangeNotice('47821', 'http://127.0.0.1:47821'), null);
+  assert.equal(portChangeNotice('0', 'http://127.0.0.1:50123'), null); // any free port was asked for
+  assert.equal(portChangeNotice(undefined, 'http://127.0.0.1:47822'), null);
+  assert.equal(portChangeNotice('47821', 'garbage'), null);
 });

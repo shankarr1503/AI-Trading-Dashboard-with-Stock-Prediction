@@ -33,3 +33,7 @@ test('describeExit', () => {
   assert.equal(describeExit(null, 'SIGKILL'), 'stopped by signal SIGKILL');
   assert.equal(describeExit(null, null), 'exited');
 });
+
+test('describeExit explains the sidecar\'s "cut off" exit code', () => {
+  assert.match(describeExit(3, null), /exit code 3: unfinished trading work had to be cancelled/);
+});

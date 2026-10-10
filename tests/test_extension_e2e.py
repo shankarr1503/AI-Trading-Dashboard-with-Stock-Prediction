@@ -7,8 +7,11 @@ validates its manifest); without Node.js the source folder is loaded instead.
 
 test_extension_end_to_end — against the real desktop sidecar started from source
   (`python -m backend.desktop --no-bot`, temporary data dir, first port free in
-  47821..47841, first registered account = administrator): "Find the desktop
-  app", options sign-in, popup PAUSED → Start (RUNNING, checked through the API)
+  47821..47841, first account = administrator, created the way the app window
+  does it: with the shell's X-Desktop-Token) and an impostor on another port of
+  that range: pairing (the impostor never gets the password or a token, "Find the
+  desktop app" picks the paired app), options sign-in, popup PAUSED → Start
+  (RUNNING, checked through the API)
   → Pause, recent decisions, the two-step panic flatten, the ticker panel with
   market data offline (errors must be shown gracefully), the badge the service
   worker sets in every state, sign-out and server shutdown.
@@ -26,6 +29,7 @@ extensions). EXTENSION_E2E_SCREENSHOTS=<dir> saves screenshots of each state.
 """
 import contextlib
 import glob
+import http.server
 import json
 import os
 import queue
@@ -82,9 +86,13 @@ pytestmark = pytest.mark.skipif(CHROMIUM is None, reason="no Chromium build foun
 
 
 def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A free port outside the desktop app's range (servers there must be paired)."""
+    while True:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port not in DESKTOP_PORTS:
+            return port
 
 
 def _api(url: str, path: str, method: str = "GET", body=None, token=None, headers=None):
@@ -120,8 +128,8 @@ def _shot(page, name: str) -> None:
 # ─── Fixtures ────────────────────────────────────────────────────────────────
 
 class Sidecar:
-    def __init__(self, proc: subprocess.Popen, url: str, log: Path):
-        self.proc, self.url, self.log = proc, url, log
+    def __init__(self, proc: subprocess.Popen, url: str, log: Path, pairing_code: str):
+        self.proc, self.url, self.log, self.pairing_code = proc, url, log, pairing_code
 
     def admin_token(self) -> str:
         status, body = _api(self.url, "/auth/login", "POST", {"email": EMAIL, "password": PASSWORD})
@@ -163,10 +171,16 @@ def sidecar(tmp_path_factory):
         proc.kill()
         pytest.fail(f"sidecar did not start:\n{log.read_text()[-4000:]}")
 
-    status, body = _api(url, "/auth/register", "POST", {"email": EMAIL, "username": USERNAME, "password": PASSWORD})
+    account = {"email": EMAIL, "username": USERNAME, "password": PASSWORD}
+    status, body = _api(url, "/auth/register", "POST", account)
+    assert status == 403 and "app window" in body["detail"], "only the app window may create the first account"
+    # What the Electron shell adds to its own window's registration request.
+    status, body = _api(url, "/auth/register", "POST", account, headers={"X-Desktop-Token": CONTROL_TOKEN})
     assert status == 201, body
     assert body["is_superuser"] is True, "desktop mode: the first account is the administrator"
-    yield Sidecar(proc, url, log)
+    pairing_code = (data_dir / "pairing.key").read_text().strip()
+    assert len(pairing_code) == 20
+    yield Sidecar(proc, url, log, pairing_code)
     if proc.poll() is None:
         _api(url, "/api/desktop/shutdown", "POST", headers={"X-Desktop-Token": CONTROL_TOKEN})
         try:
@@ -370,6 +384,76 @@ def _browser(extension_dir: Path, profile: Path):
         assert b.page_errors == [], b.page_errors
 
 
+class Impostor:
+    """
+    Another program on a port of the desktop app's range: answers /health like the app
+    and the pairing check with a made-up proof, accepts anything, and records every
+    request (so the test can check it never got the password or a token).
+    """
+
+    def __init__(self, port: int):
+        self.url = f"http://127.0.0.1:{port}"
+        self.seen: list = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self, status: int, body) -> None:
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _record(self) -> str:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+                outer.seen.append({"method": self.command, "path": self.path,
+                                   "authorization": self.headers.get("Authorization"), "body": body})
+                return body
+
+            def do_GET(self):
+                self._record()
+                if self.path == "/health":
+                    self._answer(200, {"status": "healthy", "service": "AI Trading Platform", "version": "6.6.6"})
+                elif self.path.startswith("/api/desktop/pair"):
+                    self._answer(200, {"v": 1, "server": outer.url, "proof": "0" * 64})
+                else:
+                    self._answer(200, {})
+
+            def do_POST(self):
+                self._record()
+                self._answer(200, {"access_token": "stolen", "refresh_token": "stolen", "token_type": "bearer",
+                                   "expires_in": 1800})
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _impostor_port(taken: int) -> int:
+    for port in reversed(DESKTOP_PORTS):
+        if port == taken:
+            continue
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    pytest.skip("no free port in the desktop app's range for the impostor")
+
+
 # ─── Tests ───────────────────────────────────────────────────────────────────
 
 def test_extension_end_to_end(sidecar: Sidecar, extension_dir: Path, tmp_path):
@@ -386,19 +470,58 @@ def test_extension_end_to_end(sidecar: Sidecar, extension_dir: Path, tmp_path):
             time.sleep(0.25)
         assert alarm and alarm["periodInMinutes"] == 1, alarm
 
-        # ── Options: find the desktop app, server URL rules, sign-in ─────────
-        options = b.open("options.html")
-        options.click("#server-find")
-        expect(options.locator("#server-msg")).to_contain_text(sidecar.url, timeout=20_000)
         assert int(sidecar.url.rsplit(":", 1)[1]) in DESKTOP_PORTS
+        if sidecar.url == "http://127.0.0.1:47821":                              # the default server URL
+            b.wait_badge("PAIR")                                                 # the app, but not paired yet
+
+        # ── Options: pairing, an impostor, find the desktop app, URL rules ───
+        options = b.open("options.html")
+        server_msg = options.locator("#server-msg")
+        with Impostor(_impostor_port(int(sidecar.url.rsplit(":", 1)[1]))) as impostor:
+            # Two servers answer like the app: without the pairing code neither is picked.
+            options.click("#server-find")
+            expect(server_msg).to_contain_text("Several servers answer on this computer", timeout=20_000)
+            expect(server_msg).to_contain_text(impostor.url)
+            # With the code (as copied from the tray menu) only the paired app is.
+            code = sidecar.pairing_code
+            options.fill("#pairing-code", "-".join(code[i:i + 4] for i in range(0, 20, 4)).lower())
+            options.click("#server-find")
+            expect(server_msg).to_contain_text(f"{sidecar.url}", timeout=20_000)
+            expect(server_msg).to_contain_text("(pairing code checked)")
+            expect(server_msg).to_contain_text(f"NOT your app: {impostor.url}")
+            expect(options.locator("#server-url")).to_have_value(sidecar.url)
+            options.click("#pairing-save")
+            expect(options.locator("#pairing-msg")).to_contain_text("Saved", timeout=20_000)
+            expect(options.locator("#pairing-code")).to_have_value("-".join(code[i:i + 4] for i in range(0, 20, 4)))
+
+            # Pointed at the impostor: refused before any credential leaves the browser.
+            options.fill("#server-url", impostor.url)
+            options.click("#server-save")
+            expect(server_msg).to_contain_text("could not prove it is your AI Trading Bot app", timeout=20_000)
+            b.wait_badge("!!")
+            options.fill("#email", EMAIL)
+            options.fill("#password", PASSWORD)
+            options.click("#sign-in")
+            expect(options.locator("#account-msg")).to_contain_text("Not signed in: The server at", timeout=20_000)
+            popup = b.open("popup.html", width=360)
+            expect(popup.locator("#notice-title")).to_have_text("This server is not your AI Trading Bot app",
+                                                                 timeout=20_000)
+            _shot(popup, "popup-impostor")
+            popup.close()
+            assert impostor.seen, "the impostor was asked (health and the pairing check)"
+            assert not [r for r in impostor.seen if r["method"] != "GET" or r["authorization"]], impostor.seen
+            assert PASSWORD not in json.dumps(impostor.seen)
+            assert {r["path"].split("?")[0] for r in impostor.seen} <= {"/health", "/api/desktop/pair"}
+
         options.fill("#server-url", "http://192.168.1.20:47821")
         options.click("#server-save")
-        expect(options.locator("#server-msg")).to_contain_text("https://")      # plain http refused off-loopback
+        expect(server_msg).to_contain_text("https://")                           # plain http refused off-loopback
         options.fill("#server-url", sidecar.url + "/")
         options.click("#server-save")
-        expect(options.locator("#server-msg")).to_contain_text("Connected", timeout=20_000)
+        expect(server_msg).to_contain_text("Connected", timeout=20_000)
+        expect(server_msg).to_contain_text("Paired: it proved it is your AI Trading Bot app")
         expect(options.locator("#server-url")).to_have_value(sidecar.url)
-        b.wait_badge("?")                                                        # reachable, not signed in
+        b.wait_badge("?")                                                        # paired, not signed in
 
         options.fill("#email", EMAIL)
         options.fill("#password", "wrong-password")
